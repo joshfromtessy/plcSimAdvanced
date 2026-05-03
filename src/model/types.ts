@@ -74,6 +74,7 @@ export type InstructionType =
   // Examine instructions (contacts) — can appear anywhere in series path
   | "XIC"   // Examine If Closed  — true when tag is TRUE
   | "XIO"   // Examine If Open    — true when tag is FALSE
+  | "AFI"   // Always False        — blocks rung power
   | "OSR"   // One-Shot Rising    — true for one scan on rising edge
   | "OSF"   // One-Shot Falling   — true for one scan on falling edge
   | "ONS"   // One-Shot           — passes power for one scan on rising edge of rung condition
@@ -97,22 +98,34 @@ export type InstructionType =
   | "RES"   // Reset (Timer/Counter)
   // Move/Math (output-class)
   | "MOV"   // Move               — Dest = Source (when rung TRUE)
-  | "MVM";  // Masked Move        — Dest = (Source & Mask) | (Dest & ~Mask)
+  | "MVM"   // Masked Move        — Dest = (Source & Mask) | (Dest & ~Mask)
+  | "ADD"   // Add                — Dest = Source A + Source B
+  | "SUB"   // Subtract           — Dest = Source A - Source B
+  | "MUL"   // Multiply           — Dest = Source A * Source B
+  | "DIV"   // Divide             — Dest = Source A / Source B
+  | "MOD"   // Modulo             — Dest = Source A % Source B
+  | "NEG"   // Negate             — Dest = -Source A
+  | "ABS"   // Absolute Value     — Dest = abs(Source A)
+  | "SQR"   // Square Root
+  | "CLR"   // Clear
+  | "JSR"   // Jump to Subroutine
+  | "NOP";  // No Operation
 
 /** Instructions that can appear in the middle of a series path */
 export const CONTACT_INSTRUCTIONS: ReadonlySet<InstructionType> = new Set([
-  "XIC", "XIO", "OSR", "OSF", "ONS",
+  "XIC", "XIO", "AFI", "OSR", "OSF", "ONS",
   "EQU", "NEQ", "LES", "LEQ", "GRT", "GEQ",
 ]);
 
 /** Instructions that must be at the end (rightmost) of a rung path */
 export const OUTPUT_INSTRUCTIONS: ReadonlySet<InstructionType> = new Set([
   "OTE", "OTL", "OTU", "TON", "TOF", "RTO", "CTU", "CTD", "RES",
-  "MOV", "MVM",
+  "MOV", "MVM", "ADD", "SUB", "MUL", "DIV", "MOD", "NEG", "ABS", "SQR", "CLR",
+  "JSR", "NOP",
 ]);
 
 export const COIL_OUTPUT_INSTRUCTIONS: ReadonlySet<InstructionType> = new Set([
-  "OTE", "OTL", "OTU",
+  "OTE", "OTL", "OTU", "JSR", "NOP",
 ]);
 
 export function isContact(type: InstructionType): boolean {
@@ -166,7 +179,22 @@ export interface MoveParams {
   mask?: string;     // MVM only
 }
 
-export type InstructionParams = TimerParams | CounterParams | CompareParams | MoveParams | Record<string, never>;
+/**
+ * Params for arithmetic instructions.
+ * sourceA/sourceB are tag names or numeric literals. sourceB is unused by
+ * unary instructions (NEG, ABS, SQR, CLR). dest is always a write target.
+ */
+export interface MathParams {
+  sourceA: string;
+  sourceB?: string;
+  dest: string;
+}
+
+export interface JsrParams {
+  routineName: string;
+}
+
+export type InstructionParams = TimerParams | CounterParams | CompareParams | MoveParams | MathParams | JsrParams | Record<string, never>;
 
 // ---------------------------------------------------------------------------
 // AST Node types
@@ -237,6 +265,14 @@ export interface Rung {
   powered?: boolean;
   /** If true, rung is disabled (greyed out, not scanned) */
   disabled?: boolean;
+  /** Online edit state: pending edits are visible but not scanned until accepted. */
+  onlineEditStatus?: "pending" | "pending-delete";
+  /** Snapshot of the live rung before online edits, used for scan/cancel. */
+  onlineEditOriginal?: {
+    comment: string;
+    nodes: SeriesNode[];
+    disabled?: boolean;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -353,3 +389,4 @@ export interface RungPowerState {
 }
 
 export type ScanResult = Map<string, RungPowerState>;
+

@@ -4,14 +4,21 @@ import "./StatusBar.css";
 
 export function StatusBar() {
   const { lastError, clearError } = useProjectStore();
-  const { scanCount, lastScanDurationMs, mode } = useSimulationStore();
+  const {
+    scanCount,
+    lastScanDurationMs,
+    lastScanDeltaMs,
+    scanIntervalMs,
+    taskOverrunCount,
+    mode,
+  } = useSimulationStore();
 
   return (
     <div className="statusbar">
       <div className="statusbar-left">
         {lastError ? (
           <span className="statusbar-error" onClick={clearError} title="Click to dismiss">
-            ⚠ {lastError}
+            WARN {lastError}
           </span>
         ) : (
           <span className="statusbar-ok">Ready</span>
@@ -20,7 +27,8 @@ export function StatusBar() {
       <div className="statusbar-right">
         {scanCount > 0 && (
           <span className="statusbar-scan">
-            Scan #{scanCount} · {lastScanDurationMs}ms
+            Scan #{scanCount} | task {scanIntervalMs}ms | delta {lastScanDeltaMs}ms | exec {lastScanDurationMs}ms
+            {taskOverrunCount > 0 ? ` | overruns ${taskOverrunCount}` : ""}
           </span>
         )}
         <span className={`statusbar-mode statusbar-mode--${mode}`}>

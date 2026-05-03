@@ -92,6 +92,65 @@
   padding: 0 4px;
 }
 
+.online-edit-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 4px;
+  border-left: 1px solid var(--border-light);
+}
+
+.toolbar-btn.online-edit-accept {
+  border-color: rgba(34, 204, 102, 0.65);
+  color: var(--accent-green);
+}
+
+.toolbar-btn.online-edit-accept:hover:not(:disabled) {
+  background: rgba(34, 204, 102, 0.12);
+  border-color: var(--accent-green);
+}
+
+.toolbar-btn.online-edit-cancel {
+  border-color: rgba(255, 68, 85, 0.65);
+  color: var(--accent-red);
+}
+
+.toolbar-btn.online-edit-cancel:hover:not(:disabled) {
+  background: rgba(255, 68, 85, 0.12);
+  border-color: var(--accent-red);
+}
+
+.task-period-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.task-period-control input {
+  width: 54px;
+  padding: 2px 4px;
+  background: var(--bg-app);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  color: var(--accent-yellow);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+}
+
+.task-period-control input:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+
+.task-period-control input::-webkit-inner-spin-button,
+.task-period-control input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+}
+
 .sim-mode-badge {
   font-size: 11px;
   font-weight: 600;

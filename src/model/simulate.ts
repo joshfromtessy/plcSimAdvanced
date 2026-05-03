@@ -24,10 +24,19 @@ import type {
   CounterParams,
   CompareParams,
   MoveParams,
+  MathParams,
   InstructionParams,
+  JsrParams,
 } from "./types";
 
 import { isInstruction, isBranch } from "./ast";
+
+interface ScanExecutionContext {
+  routinesByName: Map<string, Routine>;
+  result: ScanResult;
+  callStack: string[];
+  maxCallDepth: number;
+}
 
 // ---------------------------------------------------------------------------
 // Tag lookup helpers
@@ -343,6 +352,8 @@ function evaluateContact(
       return conditionIn && readTagBit(tags, node.tagName);
     case "XIO":
       return conditionIn && !readTagBit(tags, node.tagName);
+    case "AFI":
+      return false;
     case "OSR":
     case "OSF":
       // One-shots require tracking previous state per node — handled via _osBitMap
@@ -380,9 +391,23 @@ function executeOutput(
   node: InstructionNode,
   conditionIn: boolean,
   tags: Map<string, TagDefinition>,
-  deltaMs: number
+  deltaMs: number,
+  ctx: ScanExecutionContext
 ): void {
   switch (node.type) {
+    case "JSR": {
+      if (!conditionIn) break;
+      const p = node.params as JsrParams;
+      const routineName = p?.routineName?.trim();
+      if (!routineName) break;
+      const routine = ctx.routinesByName.get(routineName.toLowerCase());
+      if (!routine) break;
+      if (ctx.callStack.includes(routine.id)) break;
+      if (ctx.callStack.length >= ctx.maxCallDepth) break;
+      executeRoutine(routine, tags, deltaMs, ctx);
+      break;
+    }
+
     case "OTE":
       writeBool(tags, node.tagName, conditionIn);
       break;
@@ -555,6 +580,39 @@ function executeOutput(
       writeTagNumber(p.dest, ((src & mask) | (dest & ~mask)) | 0, tags);
       break;
     }
+
+    case "ADD":
+    case "SUB":
+    case "MUL":
+    case "DIV":
+    case "MOD":
+    case "NEG":
+    case "ABS":
+    case "SQR":
+    case "CLR": {
+      if (!conditionIn) break;
+      const p = node.params as MathParams;
+      if (!p?.dest) break;
+
+      const a = resolveOperand(p.sourceA ?? "", tags);
+      const b = resolveOperand(p.sourceB ?? "", tags);
+      let result = 0;
+
+      switch (node.type) {
+        case "ADD": result = a + b; break;
+        case "SUB": result = a - b; break;
+        case "MUL": result = a * b; break;
+        case "DIV": result = b === 0 ? 0 : a / b; break;
+        case "MOD": result = b === 0 ? 0 : a % b; break;
+        case "NEG": result = -a; break;
+        case "ABS": result = Math.abs(a); break;
+        case "SQR": result = a < 0 ? 0 : Math.sqrt(a); break;
+        case "CLR": result = 0; break;
+      }
+
+      writeTagNumber(p.dest, result, tags);
+      break;
+    }
   }
 }
 
@@ -575,7 +633,8 @@ function evaluateSeries(
   nodeOutputPowered: Map<string, boolean>,
   legPowered: Map<string, boolean>,
   deltaMs: number,
-  _insideBranch: boolean
+  _insideBranch: boolean,
+  ctx: ScanExecutionContext
 ): boolean {
   // Two-condition model:
   //   condition        — the live wire value flowing right; terminal blocks
@@ -604,6 +663,7 @@ function evaluateSeries(
         nodeOutputPowered.set(node.id, condition);
       } else if (
         node.type === "XIC" || node.type === "XIO" ||
+        node.type === "AFI" ||
         node.type === "OSR" || node.type === "OSF" ||
         node.type === "EQU" || node.type === "NEQ" ||
         node.type === "LES" || node.type === "LEQ" ||
@@ -618,7 +678,7 @@ function evaluateSeries(
       } else {
         // Output-class: execute using the current wire condition. Outputs in
         // branch legs are valid parallel output paths, so they execute too.
-        executeOutput(node, condition, tags, deltaMs);
+        executeOutput(node, condition, tags, deltaMs, ctx);
         nodePowered.set(node.id, condition);
 
         // Terminal blocks block the wire condition so coil outputs downstream
@@ -640,7 +700,7 @@ function evaluateSeries(
         }
       }
     } else if (isBranch(node)) {
-      condition = evaluateBranch(node, condition, tags, nodePowered, nodeOutputPowered, legPowered, deltaMs);
+      condition = evaluateBranch(node, condition, tags, nodePowered, nodeOutputPowered, legPowered, deltaMs, ctx);
       contactCondition = condition; // branch result feeds back into contact chain
       nodePowered.set(node.id, condition);
       nodeOutputPowered.set(node.id, condition);
@@ -657,7 +717,8 @@ function evaluateBranch(
   nodePowered: Map<string, boolean>,
   nodeOutputPowered: Map<string, boolean>,
   legPowered: Map<string, boolean>,
-  deltaMs: number
+  deltaMs: number,
+  ctx: ScanExecutionContext
 ): boolean {
   let anyTrue = false;
 
@@ -670,7 +731,8 @@ function evaluateBranch(
       nodeOutputPowered,
       legPowered,
       deltaMs,
-      true
+      true,
+      ctx
     );
     legPowered.set(leg.id, legResult);
     if (legResult) anyTrue = true;
@@ -686,7 +748,8 @@ function evaluateBranch(
 function evaluateRung(
   rung: Rung,
   tags: Map<string, TagDefinition>,
-  deltaMs: number
+  deltaMs: number,
+  ctx: ScanExecutionContext
 ): RungPowerState {
   const nodePowered       = new Map<string, boolean>();
   const nodeOutputPowered = new Map<string, boolean>();
@@ -704,7 +767,8 @@ function evaluateRung(
     nodeOutputPowered,
     legPowered,
     deltaMs,
-    false
+    false,
+    ctx
   );
 
   return { rungId: rung.id, rungPowered, nodePowered, nodeOutputPowered, legPowered };
@@ -727,16 +791,33 @@ function evaluateRung(
 export function executeScan(
   routine: Routine,
   tagMap: Map<string, TagDefinition>,
-  deltaMs: number
+  deltaMs: number,
+  routines: Routine[] = [routine]
 ): ScanResult {
-  const result: ScanResult = new Map();
+  const ctx: ScanExecutionContext = {
+    routinesByName: new Map(routines.map(r => [r.name.toLowerCase(), r])),
+    result: new Map(),
+    callStack: [],
+    maxCallDepth: 16,
+  };
+  executeRoutine(routine, tagMap, deltaMs, ctx);
+  return ctx.result;
+}
+
+function executeRoutine(
+  routine: Routine,
+  tagMap: Map<string, TagDefinition>,
+  deltaMs: number,
+  ctx: ScanExecutionContext
+): void {
+  ctx.callStack.push(routine.id);
 
   for (const rung of routine.rungs) {
-    const state = evaluateRung(rung, tagMap, deltaMs);
-    result.set(rung.id, state);
+    const state = evaluateRung(rung, tagMap, deltaMs, ctx);
+    ctx.result.set(rung.id, state);
   }
 
-  return result;
+  ctx.callStack.pop();
 }
 
 // ---------------------------------------------------------------------------

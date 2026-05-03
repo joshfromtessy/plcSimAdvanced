@@ -3,7 +3,9 @@
 // =============================================================================
 import { useState } from "react";
 import { useEditorStore } from "../../store/editorStore";
-import type { InstructionType } from "../../model/types";
+import { useProjectStore } from "../../store/projectStore";
+import { useSimulationStore } from "../../store/simulationStore";
+import type { InsertPosition, InstructionType } from "../../model/types";
 import "./InstructionPalette.css";
 
 interface PaletteItem {
@@ -18,6 +20,7 @@ const CONTACT_ITEMS: PaletteItem[] = [
   { type: "OSR", label: "OSR", description: "One-Shot Rising" },
   { type: "OSF", label: "OSF", description: "One-Shot Falling" },
   { type: "ONS", label: "ONS", description: "One Shot (inline)" },
+  { type: "AFI", label: "AFI", description: "Always False" },
 ];
 
 const OUTPUT_ITEMS: PaletteItem[] = [
@@ -50,6 +53,23 @@ const COMPARE_ITEMS: PaletteItem[] = [
 const MOVE_ITEMS: PaletteItem[] = [
   { type: "MOV", label: "MOV", description: "Move" },
   { type: "MVM", label: "MVM", description: "Masked Move" },
+];
+
+const MATH_ITEMS: PaletteItem[] = [
+  { type: "ADD", label: "ADD", description: "Add" },
+  { type: "SUB", label: "SUB", description: "Subtract" },
+  { type: "MUL", label: "MUL", description: "Multiply" },
+  { type: "DIV", label: "DIV", description: "Divide" },
+  { type: "MOD", label: "MOD", description: "Modulo" },
+  { type: "NEG", label: "NEG", description: "Negate" },
+  { type: "ABS", label: "ABS", description: "Absolute Value" },
+  { type: "SQR", label: "SQR", description: "Square Root" },
+  { type: "CLR", label: "CLR", description: "Clear" },
+];
+
+const PROGRAM_ITEMS: PaletteItem[] = [
+  { type: "JSR", label: "JSR", description: "Jump to Subroutine" },
+  { type: "NOP", label: "NOP", description: "No Operation" },
 ];
 
 // ── SVG instruction icons ──────────────────────────────────────────────────
@@ -179,6 +199,7 @@ function BlockIcon({ label }: { label: string }) {
 const ICONS: Record<string, React.ReactNode> = {
   XIC: <XICIcon />,
   XIO: <XIOIcon />,
+  AFI: <BlockIcon label="AFI" />,
   OSR: <OSRIcon />,
   OSF: <OSFIcon />,
   ONS: <ONSIcon />,
@@ -199,12 +220,25 @@ const ICONS: Record<string, React.ReactNode> = {
   GEQ: <BlockIcon label="GEQ" />,
   MOV: <BlockIcon label="MOV" />,
   MVM: <BlockIcon label="MVM" />,
+  ADD: <BlockIcon label="ADD" />,
+  SUB: <BlockIcon label="SUB" />,
+  MUL: <BlockIcon label="MUL" />,
+  DIV: <BlockIcon label="DIV" />,
+  MOD: <BlockIcon label="MOD" />,
+  NEG: <BlockIcon label="NEG" />,
+  ABS: <BlockIcon label="ABS" />,
+  SQR: <BlockIcon label="SQR" />,
+  CLR: <BlockIcon label="CLR" />,
+  JSR: <BlockIcon label="JSR" />,
+  NOP: <BlockIcon label="NOP" />,
 };
 
 // ── Component ──────────────────────────────────────────────────────────────
 
 export function InstructionPalette() {
-  const { startDrag, endDrag } = useEditorStore();
+  const { selection, startDrag, endDrag } = useEditorStore();
+  const { project, activeRoutineId, insertInstruction } = useProjectStore();
+  const { mode } = useSimulationStore();
 
   function handleDragStart(e: React.DragEvent, type: InstructionType) {
     e.dataTransfer.effectAllowed = "copy";
@@ -216,34 +250,79 @@ export function InstructionPalette() {
     endDrag();
   }
 
+  function handlePaletteClick(type: InstructionType) {
+    if (!activeRoutineId) return;
+    const routine = project.programs
+      .flatMap(program => program.routines)
+      .find(r => r.id === activeRoutineId);
+    if (!routine) return;
+
+    let position: InsertPosition;
+    if (routine.rungs.length === 0) {
+      position = { kind: "rung-append" };
+    } else if (selection?.kind === "node") {
+      position = { kind: "series-after", rungId: selection.rungId, siblingId: selection.nodeId };
+    } else if (selection?.kind === "leg") {
+      position = {
+        kind: "branch-leg-append",
+        rungId: selection.rungId,
+        branchId: selection.branchId,
+        legId: selection.legId,
+      };
+    } else if (selection?.kind === "rung") {
+      position = { kind: "series-append", rungId: selection.rungId };
+    } else {
+      position = { kind: "series-append", rungId: routine.rungs[routine.rungs.length - 1].id };
+    }
+
+    if (mode === "running") {
+      if (position.kind === "rung-append") {
+        useProjectStore.setState({ lastError: "Double-click a rung gutter to start online edit before changing logic in Run." });
+        return;
+      }
+      const targetRung = routine.rungs.find(r => r.id === position.rungId);
+      if (!targetRung?.onlineEditStatus || targetRung.onlineEditStatus === "pending-delete") {
+        useProjectStore.setState({ lastError: "Double-click the rung gutter to start online edit before changing logic in Run." });
+        return;
+      }
+    }
+
+    insertInstruction(activeRoutineId, position, type);
+  }
+
   return (
     <div className="palette">
       <div className="palette-header">Instructions</div>
 
       <PaletteGroup label="Contacts" colorClass="palette-group--contact" items={CONTACT_ITEMS}
-        onDragStart={handleDragStart} onDragEnd={handleDragEnd} />
+        onDragStart={handleDragStart} onDragEnd={handleDragEnd} onClick={handlePaletteClick} />
       <PaletteGroup label="Outputs"  colorClass="palette-group--output"  items={OUTPUT_ITEMS}
-        onDragStart={handleDragStart} onDragEnd={handleDragEnd} />
+        onDragStart={handleDragStart} onDragEnd={handleDragEnd} onClick={handlePaletteClick} />
       <PaletteGroup label="Compare"  colorClass="palette-group--compare" items={COMPARE_ITEMS}
-        onDragStart={handleDragStart} onDragEnd={handleDragEnd} />
+        onDragStart={handleDragStart} onDragEnd={handleDragEnd} onClick={handlePaletteClick} />
       <PaletteGroup label="Move"     colorClass="palette-group--move"    items={MOVE_ITEMS}
-        onDragStart={handleDragStart} onDragEnd={handleDragEnd} />
+        onDragStart={handleDragStart} onDragEnd={handleDragEnd} onClick={handlePaletteClick} />
+      <PaletteGroup label="Math"     colorClass="palette-group--math"    items={MATH_ITEMS}
+        onDragStart={handleDragStart} onDragEnd={handleDragEnd} onClick={handlePaletteClick} />
+      <PaletteGroup label="Program"  colorClass="palette-group--program" items={PROGRAM_ITEMS}
+        onDragStart={handleDragStart} onDragEnd={handleDragEnd} onClick={handlePaletteClick} />
       <PaletteGroup label="Timers"   colorClass="palette-group--timer"   items={TIMER_ITEMS}
-        onDragStart={handleDragStart} onDragEnd={handleDragEnd} />
+        onDragStart={handleDragStart} onDragEnd={handleDragEnd} onClick={handlePaletteClick} />
       <PaletteGroup label="Counters" colorClass="palette-group--counter" items={COUNTER_ITEMS}
-        onDragStart={handleDragStart} onDragEnd={handleDragEnd} />
+        onDragStart={handleDragStart} onDragEnd={handleDragEnd} onClick={handlePaletteClick} />
     </div>
   );
 }
 
 function PaletteGroup({
-  label, colorClass, items, onDragStart, onDragEnd,
+  label, colorClass, items, onDragStart, onDragEnd, onClick,
 }: {
   label: string;
   colorClass: string;
   items: PaletteItem[];
   onDragStart: (e: React.DragEvent, type: InstructionType) => void;
   onDragEnd: () => void;
+  onClick: (type: InstructionType) => void;
 }) {
   const [open, setOpen] = useState(true);
 
@@ -268,6 +347,7 @@ function PaletteGroup({
               draggable
               onDragStart={(e) => onDragStart(e, item.type)}
               onDragEnd={onDragEnd}
+              onClick={() => onClick(item.type)}
               title={`${item.label} — ${item.description}`}
             >
               <span className="palette-item-icon">{ICONS[item.type]}</span>

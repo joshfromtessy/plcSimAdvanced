@@ -2,7 +2,7 @@
   width: var(--palette-w);
   flex-shrink: 0;
   background: var(--bg-panel);
-  border-right: 1px solid var(--border);
+  border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
@@ -161,4 +161,14 @@
 .palette-group--move .palette-item-icon,
 .palette-group--move .palette-item-mnemonic {
   color: var(--accent-red);
+}
+
+.palette-group--math .palette-item-icon,
+.palette-group--math .palette-item-mnemonic {
+  color: var(--accent-green);
+}
+
+.palette-group--program .palette-item-icon,
+.palette-group--program .palette-item-mnemonic {
+  color: var(--accent-blue);
 }

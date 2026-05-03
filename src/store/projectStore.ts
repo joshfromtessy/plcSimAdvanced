@@ -25,6 +25,8 @@ import type {
   CounterParams,
   CompareParams,
   MoveParams,
+  MathParams,
+  JsrParams,
   InstructionParams,
 } from "../model/types";
 
@@ -54,6 +56,11 @@ import {
   defaultCounterData,
 } from "../model/simulate";
 
+type ProjectHistorySnapshot = {
+  project: PlcProject;
+  activeRoutineId: string | null;
+};
+
 // ---------------------------------------------------------------------------
 // Factory helpers
 // ---------------------------------------------------------------------------
@@ -70,6 +77,12 @@ function makeInstruction(type: InstructionType): InstructionNode {
     params = { source: "", dest: "" } satisfies MoveParams;
   } else if (type === "MVM") {
     params = { source: "", dest: "", mask: "0xFFFFFFFF" } satisfies MoveParams;
+  } else if (["ADD","SUB","MUL","DIV","MOD"].includes(type)) {
+    params = { sourceA: "", sourceB: "", dest: "" } satisfies MathParams;
+  } else if (["NEG","ABS","SQR","CLR"].includes(type)) {
+    params = { sourceA: "", dest: "" } satisfies MathParams;
+  } else if (type === "JSR") {
+    params = { routineName: "" } satisfies JsrParams;
   }
   return {
     kind: "instruction",
@@ -116,17 +129,29 @@ export interface ProjectState {
   activeRoutineId: string | null;
   /** Last validation error (shown in status bar) */
   lastError: string | null;
+  /** True while rung edits should be staged as online edits. */
+  onlineEditActive: boolean;
+  undoStack: ProjectHistorySnapshot[];
+  redoStack: ProjectHistorySnapshot[];
 
   // ── Project
   setProjectName: (name: string) => void;
   newProject: () => void;
   loadProject: (data: PlcProject) => void;
+  undo: () => void;
+  redo: () => void;
   /** Move a rung before or after another rung. afterRungId=null means move to top. */
   moveRung: (routineId: string, rungId: string, afterRungId: string | null) => void;
+  setOnlineEditActive: (active: boolean) => void;
+  beginOnlineEditRung: (routineId: string, rungId: string) => void;
+  acceptOnlineEdits: () => void;
+  cancelOnlineEdits: () => void;
 
   // ── Routines
   setActiveRoutine: (id: string) => void;
   addRoutine: (programId: string, name: string) => void;
+  renameRoutine: (routineId: string, name: string) => void;
+  deleteRoutine: (routineId: string) => void;
 
   // ── Rungs
   addRung: (routineId: string, comment?: string) => void;
@@ -147,6 +172,13 @@ export interface ProjectState {
   ) => ValidationResult;
 
   moveNode: (
+    routineId: string,
+    sourceRungId: string,
+    nodeId: string,
+    destination: InsertPosition
+  ) => ValidationResult;
+
+  copyNode: (
     routineId: string,
     sourceRungId: string,
     nodeId: string,
@@ -207,7 +239,7 @@ export interface ProjectState {
     routineId: string,
     rungId: string,
     nodeId: string,
-    patch: { preset?: number; presetTag?: string }
+    patch: Partial<TimerParams & CounterParams & CompareParams & MoveParams & MathParams & JsrParams>
   ) => void;
 
   // ── Node comment
@@ -240,22 +272,31 @@ export const useProjectStore = create<ProjectState>()(
       activeRoutineId:
         defaultProject.programs[0]?.routines[0]?.id ?? null,
       lastError: null,
+      onlineEditActive: false,
+      undoStack: [],
+      redoStack: [],
 
       // ── Project ──────────────────────────────────────────────────────────
 
       setProjectName: (name) =>
-        set((s) => { s.project.name = name; }),
+        set((s) => {
+          pushUndo(s);
+          s.project.name = name;
+        }),
 
       newProject: () =>
         set((s) => {
+          pushUndo(s);
           const p = makeDefaultProject();
           s.project = p;
           s.activeRoutineId = p.programs[0]?.routines[0]?.id ?? null;
           s.lastError = null;
+          s.onlineEditActive = false;
         }),
 
       loadProject: (data) =>
         set((s) => {
+          pushUndo(s);
           // Strip runtime-only _startMs from timerData so it doesn't pollute state
           const cleaned = {
             ...data,
@@ -275,6 +316,81 @@ export const useProjectStore = create<ProjectState>()(
           s.project = cleaned;
           s.activeRoutineId = cleaned.programs[0]?.routines[0]?.id ?? null;
           s.lastError = null;
+          s.onlineEditActive = false;
+        }),
+
+      undo: () =>
+        set((s) => {
+          const prev = s.undoStack.pop();
+          if (!prev) return;
+          s.redoStack.push(snapshotProjectState(s));
+          s.project = cloneProject(prev.project);
+          s.activeRoutineId = prev.activeRoutineId;
+          s.lastError = null;
+        }),
+
+      redo: () =>
+        set((s) => {
+          const next = s.redoStack.pop();
+          if (!next) return;
+          s.undoStack.push(snapshotProjectState(s));
+          s.project = cloneProject(next.project);
+          s.activeRoutineId = next.activeRoutineId;
+          s.lastError = null;
+        }),
+
+      setOnlineEditActive: (active) =>
+        set((s) => {
+          s.onlineEditActive = active;
+        }),
+
+      beginOnlineEditRung: (routineId, rungId) =>
+        set((s) => {
+          const rung = findRungInProject(s.project, routineId, rungId);
+          if (!rung || rung.onlineEditStatus) return;
+          pushUndo(s);
+          markRungOnlineEdit(rung);
+          s.lastError = null;
+        }),
+
+      acceptOnlineEdits: () =>
+        set((s) => {
+          pushUndo(s);
+          for (const program of s.project.programs) {
+            for (const routine of program.routines) {
+              routine.rungs = routine.rungs.filter((rung) => rung.onlineEditStatus !== "pending-delete");
+              for (const rung of routine.rungs) {
+                if (!rung.onlineEditStatus) continue;
+                delete rung.onlineEditStatus;
+                delete rung.onlineEditOriginal;
+              }
+            }
+          }
+          s.lastError = null;
+        }),
+
+      cancelOnlineEdits: () =>
+        set((s) => {
+          pushUndo(s);
+          for (const program of s.project.programs) {
+            for (const routine of program.routines) {
+              routine.rungs = routine.rungs.filter((rung) => {
+                return !(rung.onlineEditStatus === "pending" && !rung.onlineEditOriginal);
+              });
+              for (const rung of routine.rungs) {
+                if (!rung.onlineEditStatus) continue;
+                const original = rung.onlineEditOriginal;
+                if (original) {
+                  rung.comment = original.comment;
+                  rung.nodes = cloneSeriesNodes(original.nodes);
+                  rung.disabled = original.disabled;
+                }
+                delete rung.onlineEditStatus;
+                delete rung.onlineEditOriginal;
+              }
+            }
+          }
+          s.lastError = null;
         }),
 
       moveRung: (routineId, rungId, afterRungId) =>
@@ -283,6 +399,7 @@ export const useProjectStore = create<ProjectState>()(
           if (!routine) return;
           const idx = routine.rungs.findIndex(r => r.id === rungId);
           if (idx < 0) return;
+          pushUndo(s);
           const [rung] = routine.rungs.splice(idx, 1);
           if (afterRungId === null) {
             routine.rungs.unshift(rung);
@@ -301,9 +418,43 @@ export const useProjectStore = create<ProjectState>()(
         set((s) => {
           const prog = s.project.programs.find((p) => p.id === programId);
           if (prog) {
+            pushUndo(s);
             const r = makeRoutine(name);
             prog.routines.push(r);
             s.activeRoutineId = r.id;
+          }
+        }),
+
+      renameRoutine: (routineId, name) =>
+        set((s) => {
+          const trimmed = name.trim();
+          if (!trimmed) return;
+          const routine = findRoutine(s.project, routineId);
+          if (routine) {
+            pushUndo(s);
+            routine.name = trimmed;
+          }
+        }),
+
+      deleteRoutine: (routineId) =>
+        set((s) => {
+          for (const program of s.project.programs) {
+            const idx = program.routines.findIndex((routine) => routine.id === routineId);
+            if (idx === -1) continue;
+            if (program.routines.length <= 1) {
+              s.lastError = "A program must keep at least one routine";
+              return;
+            }
+            pushUndo(s);
+            program.routines.splice(idx, 1);
+            if (s.activeRoutineId === routineId) {
+              const nextRoutine = program.routines[Math.min(idx, program.routines.length - 1)];
+              s.activeRoutineId = nextRoutine?.id ?? s.project.programs
+                .flatMap((p) => p.routines)
+                .at(0)?.id ?? null;
+            }
+            s.lastError = null;
+            return;
           }
         }),
 
@@ -312,27 +463,43 @@ export const useProjectStore = create<ProjectState>()(
       addRung: (routineId, comment = "") =>
         set((s) => {
           const routine = findRoutine(s.project, routineId);
-          if (routine) routine.rungs.push(makeRung(comment));
+          if (routine) {
+            pushUndo(s);
+            const rung = makeRung(comment);
+            if (s.onlineEditActive) rung.onlineEditStatus = "pending";
+            routine.rungs.push(rung);
+          }
         }),
 
       deleteRung: (routineId, rungId) =>
         set((s) => {
           const routine = findRoutine(s.project, routineId);
           if (routine) {
-            routine.rungs = routine.rungs.filter((r) => r.id !== rungId);
+            const rung = routine.rungs.find((r) => r.id === rungId);
+            if (!rung) return;
+            pushUndo(s);
+            if (s.onlineEditActive && rung) {
+              markRungOnlineEdit(rung, "pending-delete");
+            } else {
+              routine.rungs = routine.rungs.filter((r) => r.id !== rungId);
+            }
           }
         }),
 
       setRungComment: (routineId, rungId, comment) =>
         set((s) => {
           const rung = findRungInProject(s.project, routineId, rungId);
-          if (rung) rung.comment = comment;
+          if (rung) {
+            pushUndo(s);
+            rung.comment = comment;
+          }
         }),
 
       setNodeComment: (routineId, rungId, nodeId, comment) =>
         set((s) => {
           const rung = findRungInProject(s.project, routineId, rungId);
           if (!rung) return;
+          pushUndo(s);
           const node = findNodeInSeries(rung.nodes, nodeId);
           if (node?.kind === "instruction") node.comment = comment || undefined;
         }),
@@ -340,7 +507,11 @@ export const useProjectStore = create<ProjectState>()(
       setRungDisabled: (routineId, rungId, disabled) =>
         set((s) => {
           const rung = findRungInProject(s.project, routineId, rungId);
-          if (rung) rung.disabled = disabled;
+          if (rung) {
+            pushUndo(s);
+            if (s.onlineEditActive) markRungOnlineEdit(rung);
+            rung.disabled = disabled;
+          }
         }),
 
       // ── Instructions ──────────────────────────────────────────────────────
@@ -366,8 +537,10 @@ export const useProjectStore = create<ProjectState>()(
           set((s) => {
             const routine = findRoutine(s.project, routineId);
             if (routine) {
+              pushUndo(s);
               const newRung = makeRung();
               const newNode = makeInstruction(type);
+              if (s.onlineEditActive) newRung.onlineEditStatus = "pending";
               newRung.nodes.push(newNode);
               routine.rungs.push(newRung);
             }
@@ -390,11 +563,13 @@ export const useProjectStore = create<ProjectState>()(
 
         // Compute the updated rung from plain objects (outside Immer draft)
         const newNode = makeInstruction(type);
-        const updatedRung = applyInsert(currentRung, position, newNode);
+        const rungForEdit = state.onlineEditActive ? withOnlineEditSnapshot(currentRung) : currentRung;
+        const updatedRung = applyInsert(rungForEdit, position, newNode);
 
         set((s) => {
           const routine = findRoutine(s.project, routineId);
           if (!routine) return;
+          pushUndo(s);
           const rungIdx = routine.rungs.findIndex((r) => r.id === rungId);
           if (rungIdx !== -1) routine.rungs[rungIdx] = updatedRung;
           s.lastError = null;
@@ -406,9 +581,16 @@ export const useProjectStore = create<ProjectState>()(
       deleteNode: (routineId, target) => {
         if (target.kind === "rung") {
           set((s) => {
-            const routine = findRoutine(s.project, routineId);
-            if (routine) {
-              routine.rungs = routine.rungs.filter((r) => r.id !== target.rungId);
+          const routine = findRoutine(s.project, routineId);
+          if (routine) {
+            const rung = routine.rungs.find((r) => r.id === target.rungId);
+            if (!rung) return;
+            pushUndo(s);
+            if (s.onlineEditActive && rung) {
+                markRungOnlineEdit(rung, "pending-delete");
+              } else {
+                routine.rungs = routine.rungs.filter((r) => r.id !== target.rungId);
+              }
             }
             s.lastError = null;
           });
@@ -433,11 +615,13 @@ export const useProjectStore = create<ProjectState>()(
         }
 
         // Compute the updated rung from plain objects (outside Immer draft)
-        const updatedRung = applyDelete(rung, target);
+        const rungForEdit = state.onlineEditActive ? withOnlineEditSnapshot(rung) : rung;
+        const updatedRung = applyDelete(rungForEdit, target);
 
         set((s) => {
           const routine = findRoutine(s.project, routineId);
           if (!routine) return;
+          pushUndo(s);
           const idx = routine.rungs.findIndex((r) => r.id === rungId);
           if (idx !== -1) routine.rungs[idx] = updatedRung;
           s.lastError = null;
@@ -521,6 +705,18 @@ export const useProjectStore = create<ProjectState>()(
         set((s) => {
           const r = findRoutine(s.project, routineId);
           if (!r) return;
+          pushUndo(s);
+
+          if (s.onlineEditActive) {
+            const srcLive = r.rungs.find((rg) => rg.id === sourceRungId);
+            const dstLive = r.rungs.find((rg) => rg.id === destRungId);
+            if (sourceRungId === destRungId) {
+              destRungFinal = withExistingOnlineEdit(destRungFinal, srcLive);
+            } else {
+              srcRungAfterDelete = withExistingOnlineEdit(srcRungAfterDelete, srcLive);
+              destRungFinal = withExistingOnlineEdit(destRungFinal, dstLive);
+            }
+          }
 
           if (sourceRungId === destRungId) {
             // Same rung — just write the combined result
@@ -540,6 +736,56 @@ export const useProjectStore = create<ProjectState>()(
         return { valid: true };
       },
 
+      copyNode: (routineId, sourceRungId, nodeId, destination) => {
+        const destRungId = (destination as any).rungId as string | undefined;
+        if (!destRungId) return { valid: false, reason: "Invalid destination" };
+
+        const state = get();
+        const routine = findRoutineFromState(state, routineId);
+        if (!routine) {
+          const e = { valid: false as const, reason: "Routine not found" };
+          set((s) => { s.lastError = e.reason; });
+          return e;
+        }
+
+        const srcRung = findRung(routine, sourceRungId);
+        const destRung = findRung(routine, destRungId);
+        if (!srcRung || !destRung) {
+          const e = { valid: false as const, reason: "Rung not found" };
+          set((s) => { s.lastError = e.reason; });
+          return e;
+        }
+
+        const srcNode = findNodeInSeries(srcRung.nodes, nodeId);
+        if (!srcNode) {
+          const e = { valid: false as const, reason: "Node not found" };
+          set((s) => { s.lastError = e.reason; });
+          return e;
+        }
+
+        const typeForValidation = srcNode.kind === "instruction" ? srcNode.type : "XIC";
+        const result = validateInsert(destRung, destination, typeForValidation);
+        if (!result.valid) {
+          set((s) => { s.lastError = result.reason; });
+          return result;
+        }
+
+        const newNode = cloneNodeWithNewIds(srcNode);
+        const rungForEdit = state.onlineEditActive ? withOnlineEditSnapshot(destRung) : destRung;
+        const updatedRung = applyInsert(rungForEdit, destination, newNode);
+
+        set((s) => {
+          const r = findRoutine(s.project, routineId);
+          if (!r) return;
+          pushUndo(s);
+          const idx = r.rungs.findIndex((rg) => rg.id === destRungId);
+          if (idx !== -1) r.rungs[idx] = updatedRung;
+          s.lastError = null;
+        });
+
+        return { valid: true };
+      },
+
       wrapNodeInBranch: (routineId, rungId, nodeId) => {
         const state = get();
         const routine = findRoutineFromState(state, routineId);
@@ -550,10 +796,11 @@ export const useProjectStore = create<ProjectState>()(
         const newNodes = wrapInEmptyBranch(rung.nodes, nodeId);
         if (!newNodes) return { valid: false, reason: "Node not found in rung" };
 
-        const updatedRung: Rung = { ...rung, nodes: newNodes };
+        const updatedRung: Rung = { ...(state.onlineEditActive ? withOnlineEditSnapshot(rung) : rung), nodes: newNodes };
         set((s) => {
           const r = findRoutine(s.project, routineId);
           if (!r) return;
+          pushUndo(s);
           const idx = r.rungs.findIndex((rg) => rg.id === rungId);
           if (idx !== -1) r.rungs[idx] = updatedRung;
           s.lastError = null;
@@ -571,13 +818,14 @@ export const useProjectStore = create<ProjectState>()(
         // branch-add-leg ignores the newNode — it just appends an empty leg
         const dummy = makeInstruction("XIC");
         const updatedRung = applyInsert(
-          rung,
+          state.onlineEditActive ? withOnlineEditSnapshot(rung) : rung,
           { kind: "branch-add-leg", rungId, branchId },
           dummy
         );
         set((s) => {
           const r = findRoutine(s.project, routineId);
           if (!r) return;
+          pushUndo(s);
           const idx = r.rungs.findIndex((rg) => rg.id === rungId);
           if (idx !== -1) r.rungs[idx] = updatedRung;
           s.lastError = null;
@@ -604,7 +852,10 @@ export const useProjectStore = create<ProjectState>()(
         const nodeToAbsorb = cloneNode(loc.list[targetIdx]);  // plain clone, same id
 
         // Step 1: remove the neighbour from wherever it sits in the rung
-        let updated = applyDelete(rung, { kind: "node", rungId, nodeId: nodeToAbsorb.id });
+        let updated = applyDelete(
+          state.onlineEditActive ? withOnlineEditSnapshot(rung) : rung,
+          { kind: "node", rungId, nodeId: nodeToAbsorb.id }
+        );
 
         // Step 2: append (or prepend) it to the target leg
         if (direction === "next") {
@@ -626,6 +877,7 @@ export const useProjectStore = create<ProjectState>()(
         set((s) => {
           const r = findRoutine(s.project, routineId);
           if (!r) return;
+          pushUndo(s);
           const idx = r.rungs.findIndex(rg => rg.id === rungId);
           if (idx !== -1) r.rungs[idx] = updated;
           s.lastError = null;
@@ -651,7 +903,10 @@ export const useProjectStore = create<ProjectState>()(
         );
 
         // Step 1: remove the node from the leg
-        let updated = applyDelete(rung, { kind: "node", rungId, nodeId: ejected.id });
+        let updated = applyDelete(
+          state.onlineEditActive ? withOnlineEditSnapshot(rung) : rung,
+          { kind: "node", rungId, nodeId: ejected.id }
+        );
 
         // Step 2: insert it adjacent to the branch in the parent series
         if (side === "last") {
@@ -663,6 +918,7 @@ export const useProjectStore = create<ProjectState>()(
         set((s) => {
           const r = findRoutine(s.project, routineId);
           if (!r) return;
+          pushUndo(s);
           const idx = r.rungs.findIndex(rg => rg.id === rungId);
           if (idx !== -1) r.rungs[idx] = updated;
           s.lastError = null;
@@ -676,6 +932,8 @@ export const useProjectStore = create<ProjectState>()(
           if (!routine) return;
           const rung = findRung(routine, rungId);
           if (!rung) return;
+          pushUndo(s);
+          if (s.onlineEditActive) markRungOnlineEdit(rung);
           const node = findInstructionNode(rung.nodes, nodeId);
           patchNodeParams(rung.nodes, nodeId, patch);
           if (patch.preset !== undefined && patch.presetTag === "" && node?.tagName) {
@@ -707,6 +965,8 @@ export const useProjectStore = create<ProjectState>()(
           if (!routine) return;
           const rung = findRung(routine, rungId);
           if (!rung) return;
+          pushUndo(s);
+          if (s.onlineEditActive) markRungOnlineEdit(rung);
           const idx = routine.rungs.findIndex((r) => r.id === rungId);
           if (idx === -1) return;
           // Deep-set tagName on the node
@@ -737,6 +997,7 @@ export const useProjectStore = create<ProjectState>()(
         set((s) => {
           // Don't allow duplicate names
           if (s.project.tags.find((t) => t.name === name)) return;
+          pushUndo(s);
           const isArray = size !== undefined && size > 1;
           const tag: TagDefinition = {
             id: genId("tag"),
@@ -757,6 +1018,8 @@ export const useProjectStore = create<ProjectState>()(
 
       deleteTag: (tagId) =>
         set((s) => {
+          if (!s.project.tags.find((t) => t.id === tagId)) return;
+          pushUndo(s);
           s.project.tags = s.project.tags.filter((t) => t.id !== tagId);
         }),
 
@@ -796,13 +1059,19 @@ export const useProjectStore = create<ProjectState>()(
       setTagName: (tagId, newName) =>
         set((s) => {
           const tag = s.project.tags.find((t) => t.id === tagId);
-          if (tag) tag.name = newName;
+          if (tag) {
+            pushUndo(s);
+            tag.name = newName;
+          }
         }),
 
       setTagDescription: (tagId, description) =>
         set((s) => {
           const tag = s.project.tags.find((t) => t.id === tagId);
-          if (tag) tag.description = description || undefined;
+          if (tag) {
+            pushUndo(s);
+            tag.description = description || undefined;
+          }
         }),
 
       clearError: () => set((s) => { s.lastError = null; }),
@@ -820,6 +1089,23 @@ function findRoutine(project: PlcProject, routineId: string): Routine | undefine
     if (r) return r;
   }
   return undefined;
+}
+
+function cloneProject(project: PlcProject): PlcProject {
+  return JSON.parse(JSON.stringify(project)) as PlcProject;
+}
+
+function snapshotProjectState(state: Pick<ProjectState, "project" | "activeRoutineId">): ProjectHistorySnapshot {
+  return {
+    project: cloneProject(state.project),
+    activeRoutineId: state.activeRoutineId,
+  };
+}
+
+function pushUndo(state: ProjectState): void {
+  state.undoStack.push(snapshotProjectState(state));
+  if (state.undoStack.length > 100) state.undoStack.shift();
+  state.redoStack = [];
 }
 
 function findRoutineFromState(
@@ -855,10 +1141,50 @@ function findInstructionNode(
   return undefined;
 }
 
+function cloneSeriesNodes(nodes: SeriesNode[]): SeriesNode[] {
+  return JSON.parse(JSON.stringify(nodes)) as SeriesNode[];
+}
+
+function snapshotRung(rung: Rung): NonNullable<Rung["onlineEditOriginal"]> {
+  return {
+    comment: rung.comment,
+    nodes: cloneSeriesNodes(rung.nodes),
+    disabled: rung.disabled,
+  };
+}
+
+function markRungOnlineEdit(rung: Rung, status: Rung["onlineEditStatus"] = "pending"): void {
+  if (!rung.onlineEditStatus) {
+    rung.onlineEditOriginal = snapshotRung(rung);
+  }
+  rung.onlineEditStatus = status;
+}
+
+function withOnlineEditSnapshot(rung: Rung): Rung {
+  if (rung.onlineEditStatus) return rung;
+  return {
+    ...rung,
+    onlineEditStatus: "pending",
+    onlineEditOriginal: snapshotRung(rung),
+  };
+}
+
+function withExistingOnlineEdit(updated: Rung, live?: Rung): Rung {
+  if (updated.onlineEditStatus) return updated;
+  if (live?.onlineEditStatus) {
+    return {
+      ...updated,
+      onlineEditStatus: live.onlineEditStatus,
+      onlineEditOriginal: live.onlineEditOriginal,
+    };
+  }
+  return withOnlineEditSnapshot(updated);
+}
+
 function patchNodeParams(
   nodes: SeriesNode[],
   nodeId: string,
-  patch: { preset?: number; presetTag?: string }
+  patch: Partial<TimerParams & CounterParams & CompareParams & MoveParams & MathParams & JsrParams>
 ): boolean {
   for (const node of nodes) {
     if (node.kind === "instruction" && node.id === nodeId) {

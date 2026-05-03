@@ -10,9 +10,21 @@ interface ToolbarProps {
 }
 
 export function Toolbar({ theme, onToggleTheme }: ToolbarProps) {
-  const { mode, start, stop, singleScan } = useSimulationStore();
-  const { project, newProject, loadProject } = useProjectStore();
+  const { mode, start, stop, singleScan, scanIntervalMs, setScanInterval } = useSimulationStore();
+  const {
+    project,
+    newProject,
+    loadProject,
+    setOnlineEditActive,
+    acceptOnlineEdits,
+    cancelOnlineEdits,
+  } = useProjectStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hasOnlineEdits = project.programs.some((program) =>
+    program.routines.some((routine) =>
+      routine.rungs.some((rung) => rung.onlineEditStatus)
+    )
+  );
 
   function handleBranchDragStart(e: React.DragEvent) {
     e.dataTransfer.effectAllowed = "copy";
@@ -62,6 +74,25 @@ export function Toolbar({ theme, onToggleTheme }: ToolbarProps) {
     }
   }
 
+  function handleRunToggle() {
+    if (mode === "running") {
+      stop();
+      setOnlineEditActive(false);
+    } else {
+      start();
+      setOnlineEditActive(true);
+    }
+  }
+
+  function handleAcceptEdits() {
+    acceptOnlineEdits();
+  }
+
+  function handleCancelEdits() {
+    if (!window.confirm("Cancel all pending online edits?")) return;
+    cancelOnlineEdits();
+  }
+
   return (
     <div className="toolbar">
       {/* Left: brand + project name + file ops */}
@@ -96,7 +127,7 @@ export function Toolbar({ theme, onToggleTheme }: ToolbarProps) {
       <div className="toolbar-center">
         <button
           className={`toolbar-btn sim-btn ${mode === "running" ? "active" : ""}`}
-          onClick={() => mode === "running" ? stop() : start()}
+          onClick={handleRunToggle}
           title={mode === "running" ? "Stop (F5)" : "Run (F5)"}
         >
           {mode === "running" ? (
@@ -119,7 +150,30 @@ export function Toolbar({ theme, onToggleTheme }: ToolbarProps) {
 
         <div className="toolbar-sim-status">
           <span className={`sim-mode-badge ${mode}`}>{mode}</span>
+          <label className="task-period-control" title="Periodic task period">
+            <span>Task</span>
+            <input
+              type="number"
+              min={10}
+              max={5000}
+              step={10}
+              value={scanIntervalMs}
+              onChange={e => setScanInterval(Number(e.target.value))}
+            />
+            <span>ms</span>
+          </label>
         </div>
+
+        {hasOnlineEdits && (
+          <div className="online-edit-controls">
+            <button className="toolbar-btn online-edit-accept" onClick={handleAcceptEdits}>
+              Accept Edits
+            </button>
+            <button className="toolbar-btn online-edit-cancel" onClick={handleCancelEdits}>
+              Cancel Edits
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="toolbar-tools">

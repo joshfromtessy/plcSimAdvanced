@@ -22,6 +22,7 @@ import { isInstruction, isBranch } from "../model/ast";
 
 export const RAIL_W        = 6;    // width of left/right power rail
 export const INST_W        = 80;   // instruction block width
+export const FUNCTION_INST_W = 104; // compare/move/math blocks need room for live values
 export const INST_H        = 52;   // instruction block height (contacts / coils / RES)
 export const COMPLEX_INST_H       = 88;  // taller block for TON/TOF/RTO/CTU/CTD
 export const COMPLEX_INST_WIRE_Y  = 20;  // wireYLocal for complex blocks (wire near top)
@@ -158,7 +159,11 @@ interface SizeResult {
 }
 
 const TIMER_COUNTER_TYPES   = new Set(["TON", "TOF", "RTO", "CTU", "CTD"]);
-const COMPARE_MOVE_TYPES    = new Set(["EQU", "NEQ", "LES", "LEQ", "GRT", "GEQ", "MOV", "MVM"]);
+const COMPARE_MOVE_TYPES    = new Set([
+  "EQU", "NEQ", "LES", "LEQ", "GRT", "GEQ", "MOV", "MVM",
+  "ADD", "SUB", "MUL", "DIV", "MOD", "NEG", "ABS", "SQR", "CLR",
+  "JSR",
+]);
 
 /** Set before each layoutRung call; used by measureInstruction (single-threaded, safe). */
 let _showNodeComments = false;
@@ -170,7 +175,7 @@ function measureInstruction(node: InstructionNode): SizeResult {
   }
   if (COMPARE_MOVE_TYPES.has(node.type)) {
     // Two data rows (sourceA/B or source/dest) — a bit shorter than timers
-    return { w: INST_W, h: 72 + ch, wireYLocal: COMPLEX_INST_WIRE_Y + ch };
+    return { w: FUNCTION_INST_W, h: 72 + ch, wireYLocal: COMPLEX_INST_WIRE_Y + ch };
   }
   return { w: INST_W, h: INST_H + ch, wireYLocal: INST_H / 2 + ch };
 }
@@ -387,7 +392,9 @@ export interface LayoutRungOptions {
  */
 export function layoutRung(rung: Rung, availableW: number, opts?: LayoutRungOptions): LayoutRung {
   _showNodeComments = opts?.showNodeComments ?? false;
-  const commentAreaH = (opts?.showRungComments ?? false) ? RUNG_COMMENT_H : 0;
+  const commentAreaH = (opts?.showRungComments ?? false) && rung.comment.trim()
+    ? RUNG_COMMENT_H
+    : 0;
   const seriesStartX = RAIL_W + RUNG_PAD_H;
   const minHalf      = (INST_H + BRANCH_PAD_V * 2) / 2;
 

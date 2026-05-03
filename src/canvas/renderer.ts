@@ -11,7 +11,7 @@ import {
   Rectangle,
 } from "pixi.js";
 
-import type { Rung, SeriesNode, InstructionNode, InsertPosition, RungPowerState, InstructionType, TagDefinition, TimerParams, CounterParams } from "../model/types";
+import type { Rung, SeriesNode, InstructionNode, InsertPosition, RungPowerState, InstructionType, TagDefinition, TimerParams, CounterParams, CompareParams, MoveParams, MathParams, JsrParams } from "../model/types";
 import { isCoilOutput, isOutput } from "../model/types";
 import { isInstruction, isBranch } from "../model/ast";
 import {
@@ -116,6 +116,28 @@ export interface RenderedRung {
   dirty: boolean;
 }
 
+interface VisualRung {
+  key: string;
+  rung: Rung;
+  sourceRungId: string;
+  rungNumber: number;
+  readOnly: boolean;
+  label?: "LIVE" | "EDIT";
+}
+
+type KeyboardNavTarget =
+  | { kind: "node"; rungId: string; nodeId: string }
+  | { kind: "rung"; rungId: string }
+  | null;
+
+interface NavNode {
+  rungId: string;
+  nodeId: string;
+  cx: number;
+  cy: number;
+  order: number;
+}
+
 // ---------------------------------------------------------------------------
 // Main renderer class
 // ---------------------------------------------------------------------------
@@ -126,6 +148,7 @@ export class LadderRenderer {
   private _bgContainer: Container;
   private _rungs: Map<string, RenderedRung> = new Map();
   private _selectedNodeId: string | null = null;
+  private _selectedRungId: string | null = null;
 
   onNodeClick?:   (rungId: string, nodeId: string, legId?: string) => void;
   onRungClick?:   (rungId: string) => void;
@@ -215,8 +238,9 @@ export class LadderRenderer {
 
   // ── Public API ────────────────────────────────────────────────────────────
 
-  setSelection(nodeId: string | null) {
+  setSelection(nodeId: string | null, rungId: string | null = null) {
     this._selectedNodeId = nodeId;
+    this._selectedRungId = rungId;
   }
 
   setTagData(tags: TagDefinition[]) {
@@ -235,6 +259,72 @@ export class LadderRenderer {
     // Strip array index and/or dot suffix to get base name
     const base = tagName.replace(/\[\d+\]/, "").replace(/\.\w+$/, "");
     return base !== tagName ? this._tagDataMap.get(base) : undefined;
+  }
+
+  private _parseTagRef(name: string): { base: string; idx?: number; bit?: number; member?: string } {
+    const arrayBitRe = /^([A-Za-z_]\w*)\[(\d+)\]\.(\w+)$/;
+    const arrayRe    = /^([A-Za-z_]\w*)\[(\d+)\]$/;
+    const dotRe      = /^([A-Za-z_]\w*)\.(\w+)$/;
+    let m: RegExpMatchArray | null;
+    if ((m = name.match(arrayBitRe))) {
+      const suffix = m[3];
+      const bitNum = parseInt(suffix, 10);
+      return isNaN(bitNum)
+        ? { base: m[1], idx: parseInt(m[2], 10), member: suffix.toUpperCase() }
+        : { base: m[1], idx: parseInt(m[2], 10), bit: bitNum };
+    }
+    if ((m = name.match(arrayRe))) return { base: m[1], idx: parseInt(m[2], 10) };
+    if ((m = name.match(dotRe))) {
+      const suffix = m[2];
+      const bitNum = parseInt(suffix, 10);
+      return isNaN(bitNum) ? { base: m[1], member: suffix.toUpperCase() } : { base: m[1], bit: bitNum };
+    }
+    return { base: name };
+  }
+
+  private _readNumericValue(refName: string): number | null {
+    if (!refName) return null;
+    if (/^0x[0-9a-fA-F]+$/i.test(refName)) return parseInt(refName, 16);
+    const literal = Number(refName);
+    if (!isNaN(literal)) return literal;
+
+    const ref = this._parseTagRef(refName);
+    const tag = this._tagDataMap.get(ref.base);
+    if (!tag) return null;
+
+    if (tag.dataType === "BOOL") return tag.value ? 1 : 0;
+    if (tag.dataType === "REAL") return tag.value as number;
+    if (tag.dataType === "DINT" || tag.dataType === "INT") {
+      const raw = Array.isArray(tag.value)
+        ? ((tag.value as number[])[ref.idx ?? 0] ?? 0)
+        : (tag.value as number);
+      return ref.bit !== undefined ? ((raw >> ref.bit) & 1) : raw;
+    }
+    if (tag.dataType === "TIMER" && tag.timerData && ref.member) {
+      const td = tag.timerData;
+      if (ref.member === "PRE") return td.preset;
+      if (ref.member === "ACC") return td.accum;
+      if (ref.member === "EN") return td.en ? 1 : 0;
+      if (ref.member === "TT") return td.tt ? 1 : 0;
+      if (ref.member === "DN") return td.dn ? 1 : 0;
+    }
+    if (tag.dataType === "COUNTER" && tag.counterData && ref.member) {
+      const cd = tag.counterData;
+      if (ref.member === "PRE") return cd.preset;
+      if (ref.member === "ACC") return cd.accum;
+      if (ref.member === "CU") return cd.cu ? 1 : 0;
+      if (ref.member === "CD") return cd.cd ? 1 : 0;
+      if (ref.member === "DN") return cd.dn ? 1 : 0;
+      if (ref.member === "OV") return cd.ov ? 1 : 0;
+      if (ref.member === "UN") return cd.un ? 1 : 0;
+    }
+    return null;
+  }
+
+  private _formatLiveValue(refName: string): string {
+    const value = this._readNumericValue(refName);
+    if (value === null) return "";
+    return Number.isInteger(value) ? String(value) : String(+value.toFixed(3));
   }
 
   setThemeColors(colors: RendererColors) {
@@ -268,8 +358,9 @@ export class LadderRenderer {
     tagValues: Map<string, boolean> = new Map()
   ): { h: number; w: number } {
     this._tagValues = tagValues;
+    const visualRungs = this._buildVisualRungs(rungs);
     // Remove stale rungs
-    const currentIds = new Set(rungs.map(r => r.id));
+    const currentIds = new Set(visualRungs.map(r => r.key));
     for (const [id, rr] of this._rungs) {
       if (!currentIds.has(id)) {
         this._stage.removeChild(rr.container);
@@ -285,8 +376,8 @@ export class LadderRenderer {
     // ── Pass 1: compute all layouts so we know maxSeriesEndX before drawing ──
     // This is necessary so every rung's wire can extend all the way to the right
     // power rail, even when that rung is narrower than the widest rung.
-    const rungLayouts: LayoutRung[] = rungs.map(rung =>
-      layoutRung(rung, bodyW, {
+    const rungLayouts: LayoutRung[] = visualRungs.map(visual =>
+      layoutRung(visual.rung, bodyW, {
         showNodeComments: this._showNodeComments,
         showRungComments: this._showRungComments,
       })
@@ -300,34 +391,41 @@ export class LadderRenderer {
 
     // ── Pass 2: position containers and draw ─────────────────────────────────
     let curY = 0;
-    for (let ri = 0; ri < rungs.length; ri++) {
-      const rung   = rungs[ri];
+    for (let ri = 0; ri < visualRungs.length; ri++) {
+      const visual = visualRungs[ri];
+      const rung   = visual.rung;
       const layout = rungLayouts[ri];
-      const power  = powerStates.get(rung.id);
-      this._rungLayoutData.push({ rungId: rung.id, y: curY, h: layout.totalH, layout, nodes: rung.nodes });
+      const power  = visual.label === "EDIT" ? null : powerStates.get(visual.sourceRungId);
+      if (!visual.readOnly) {
+        this._rungLayoutData.push({ rungId: visual.sourceRungId, y: curY, h: layout.totalH, layout, nodes: rung.nodes });
+      }
 
-      let rr = this._rungs.get(rung.id);
+      let rr = this._rungs.get(visual.key);
       if (!rr) {
         const container = new Container();
         container.eventMode = "static";
         container.cursor = "pointer";
         this._stage.addChild(container);
-        rr = { rungId: rung.id, container, layout, dirty: true };
-        this._rungs.set(rung.id, rr);
+        rr = { rungId: visual.key, container, layout, dirty: true };
+        this._rungs.set(visual.key, rr);
       }
 
       rr.container.position.set(this.RUNG_NUMBER_W, curY);
       rr.layout = layout;
-      this._drawRung(rr, rung, layout, power ?? null, ri + 1);
+      this._drawRung(rr, rung, layout, power ?? null, visual.rungNumber, {
+        readOnly: visual.readOnly,
+        sourceRungId: visual.sourceRungId,
+        label: visual.label,
+      });
 
       curY += layout.totalH;
-      if (ri < rungs.length - 1) separatorYs.push(curY);
+      if (ri < visualRungs.length - 1) separatorYs.push(curY);
     }
 
     const totalH = curY;
 
     // Right rail sits after the widest rung's content (+ small gap for the wire stub)
-    const rightRailX = rungs.length > 0
+    const rightRailX = visualRungs.length > 0
       ? this.RUNG_NUMBER_W + maxSeriesEndX + 4
       : canvasW - 22;
     const contentW = rightRailX + RAIL_W + 8;
@@ -344,6 +442,49 @@ export class LadderRenderer {
     this._stage.addChild(this._rungDropGfx);
 
     return { h: totalH + 8, w: contentW };
+  }
+
+  private _buildVisualRungs(rungs: Rung[]): VisualRung[] {
+    const rows: VisualRung[] = [];
+    for (let i = 0; i < rungs.length; i++) {
+      const rung = rungs[i];
+      const rungNumber = i + 1;
+      if (rung.onlineEditStatus && rung.onlineEditOriginal) {
+        const liveRung: Rung = {
+          ...rung,
+          comment: rung.onlineEditOriginal.comment,
+          nodes: rung.onlineEditOriginal.nodes,
+          disabled: rung.onlineEditOriginal.disabled,
+          onlineEditStatus: undefined,
+          onlineEditOriginal: undefined,
+        };
+        rows.push({
+          key: `${rung.id}:live`,
+          rung: liveRung,
+          sourceRungId: rung.id,
+          rungNumber,
+          readOnly: true,
+          label: "LIVE",
+        });
+        rows.push({
+          key: `${rung.id}:edit`,
+          rung,
+          sourceRungId: rung.id,
+          rungNumber,
+          readOnly: false,
+          label: "EDIT",
+        });
+      } else {
+        rows.push({
+          key: rung.id,
+          rung,
+          sourceRungId: rung.id,
+          rungNumber,
+          readOnly: false,
+        });
+      }
+    }
+    return rows;
   }
 
   // ── Background (rails, gutter, separators) ────────────────────────────────
@@ -386,7 +527,8 @@ export class LadderRenderer {
     rung: Rung,
     layout: LayoutRung,
     power: RungPowerState | null,
-    rungNumber: number
+    rungNumber: number,
+    opts: { readOnly?: boolean; sourceRungId?: string; label?: "LIVE" | "EDIT" } = {}
   ) {
     // Clear children and listeners — listeners stack up across re-renders otherwise
     rr.container.removeChildren().forEach(c => c.destroy({ children: true }));
@@ -404,12 +546,45 @@ export class LadderRenderer {
 
     const g = new Graphics();
     rr.container.addChild(g);
+    const sourceRungId = opts.sourceRungId ?? rung.id;
+    const readOnly = !!opts.readOnly;
+
+    const rungSelected = !readOnly && this._selectedRungId === sourceRungId;
+    if (rungSelected) {
+      g.rect(-this.RUNG_NUMBER_W, 0, this.RUNG_NUMBER_W, layout.totalH)
+        .fill({ color: C.nodeSelected, alpha: 0.12 });
+      g.rect(-this.RUNG_NUMBER_W, 0, 4, layout.totalH)
+        .fill({ color: C.nodeSelected, alpha: 0.95 });
+    }
+
+    if (opts.label || rung.onlineEditStatus) {
+      const color = opts.label === "LIVE"
+        ? 0x6a9eff
+        : rung.onlineEditStatus === "pending-delete"
+          ? 0xff4455
+          : 0xf0b429;
+      g.rect(0, 0, Math.max(layout.seriesEndX, this._rightRailLocalX), layout.totalH)
+        .fill({ color, alpha: opts.label === "LIVE" ? 0.035 : 0.045 });
+      const label = new Text({
+        text: opts.label ?? (rung.onlineEditStatus === "pending-delete" ? "PENDING DELETE" : "ONLINE EDIT"),
+        style: new TextStyle({
+          fontFamily: "Consolas, monospace",
+          fontSize: 10,
+          fontWeight: "700",
+          fill: color,
+          letterSpacing: 0.4,
+        }),
+      });
+      label.anchor.set(0, 0);
+      label.position.set(RAIL_W + 10, 5);
+      rr.container.addChild(label);
+    }
 
     // Main horizontal wire
     this._drawMainWire(g, layout, rung.nodes, power);
 
     // Nodes (or empty hint)
-    if (rung.nodes.length === 0) {
+    if (rung.nodes.length === 0 && !readOnly) {
       for (let dx = RAIL_W + 8; dx < layout.seriesEndX; dx += 12) {
         g.moveTo(dx, layout.wireY)
           .lineTo(Math.min(dx + 7, layout.seriesEndX), layout.wireY)
@@ -437,68 +612,58 @@ export class LadderRenderer {
       const visualOutPowered = i < layout.nodes.length - 1
         ? this._wireBetweenPw(power, rung.nodes, layout.nodes[i], layout.nodes[i + 1])
         : undefined;
-      this._drawNode(g, rr.container, layout.nodes[i], rung, power, inputPowered, visualOutPowered);
+      this._drawNode(g, rr.container, layout.nodes[i], rung, power, inputPowered, visualOutPowered, readOnly);
     }
 
     // Fold-wrap continuation arrows (no-op for single-band rungs)
     this._drawBandFolds(g, layout);
 
-    // Body click handler — hit-test nodes, fall back to rung selection
-    rr.container.on("pointerdown", (e) => {
-      const local = rr.container.toLocal(e.global);
-      const hit = hitTest(layout.nodes, local.x, local.y);
-      if (hit) {
-        this.onNodeClick?.(rung.id, hit.nodeId, hit.legId);
-      } else {
-        this.onRungClick?.(rung.id);
-      }
-    });
+    if (!readOnly) {
+      // Body click handler — hit-test nodes, fall back to rung selection
+      rr.container.on("pointerdown", (e) => {
+        const local = rr.container.toLocal(e.global);
+        const hit = hitTest(layout.nodes, local.x, local.y);
+        if (hit) {
+          this.onNodeClick?.(sourceRungId, hit.nodeId, hit.legId);
+        } else {
+          this.onRungClick?.(sourceRungId);
+        }
+      });
+    }
 
-    // ── Gutter: rung number + × delete button ──────────────────────────────
-    // The gutter acts as a drag handle for reordering.  Only the tiny × icon
-    // area triggers delete — clicking anywhere else just initiates a drag.
+    // ── Gutter: rung number / drag handle ──────────────────────────────────
     const gutterCtr = new Container();
     gutterCtr.eventMode = "static";
-    gutterCtr.cursor = "grab";
+    gutterCtr.cursor = readOnly ? "default" : "grab";
     gutterCtr.hitArea = new Rectangle(
       -this.RUNG_NUMBER_W, 0, this.RUNG_NUMBER_W - 2, layout.totalH
     );
     gutterCtr.on("pointerdown", (e) => {
       e.stopPropagation();
-      // × is at container-local (-RUNG_NUMBER_W + 10, wireY).
-      // Only fire delete when the pointer is within 12 px of that point.
-      const local = rr.container.toLocal(e.global);
-      const delX  = -this.RUNG_NUMBER_W + 10;
-      const delY  = layout.wireY;
-      if (Math.abs(local.x - delX) < 12 && Math.abs(local.y - delY) < 12) {
-        this.onRungDelete?.(rung.id);
-      }
+      if (readOnly) return;
+      this.onRungClick?.(sourceRungId);
       // Drag-start is handled by PixiCanvas's DOM-level handlePointerDown.
     });
     rr.container.addChild(gutterCtr);
 
     // Rung number
-    const numText = new Text({ text: String(rungNumber), style: STYLE_RUNG_NUM });
+    const numText = new Text({
+      text: opts.label === "LIVE" ? `${rungNumber}L` : opts.label === "EDIT" ? `${rungNumber}E` : String(rungNumber),
+      style: rungSelected
+        ? new TextStyle({
+            fontFamily: "Consolas, monospace",
+            fontSize: 11,
+            fontWeight: "700",
+            fill: C.textBlue,
+          })
+        : STYLE_RUNG_NUM,
+    });
     numText.anchor.set(1, 0.5);
     numText.position.set(-14, layout.wireY);
     gutterCtr.addChild(numText);
 
-    // × delete icon (dim, brightens on hover via alpha isn't easy in Pixi,
-    // so keep it subtle but visible)
-    const delText = new Text({
-      text: "×",
-      style: new TextStyle({
-        fontFamily: "Consolas, monospace",
-        fontSize: 13,
-        fill: C.textDim,
-      }),
-    });
-    delText.anchor.set(0.5, 0.5);
-    delText.position.set(-this.RUNG_NUMBER_W + 10, layout.wireY);
-    gutterCtr.addChild(delText);
-
     // ── Rung comment bar ──────────────────────────────────────────────────────
-    if (this._showRungComments) {
+    if (this._showRungComments && rung.comment) {
       const caH = layout.commentAreaH; // = RUNG_COMMENT_H or 0 (shouldn't be 0 here)
       if (caH > 0) {
         // Faint bar background
@@ -507,14 +672,11 @@ export class LadderRenderer {
         g.moveTo(0, caH).lineTo(layout.seriesEndX + RAIL_W + 20, caH)
           .stroke({ color: C.separator, width: 1 });
 
-        const cmtText = rung.comment
-          ? "// " + rung.comment
-          : "// double-click to add rung comment";
         const cmt = new Text({
-          text: cmtText,
+          text: "// " + rung.comment,
           style: new TextStyle({
             fontSize: 9,
-            fill: rung.comment ? C.textDim : 0x363648,
+            fill: C.textDim,
             fontFamily: "Consolas, monospace",
             fontStyle: "italic",
           }),
@@ -523,14 +685,6 @@ export class LadderRenderer {
         cmt.position.set(RAIL_W + 6, caH / 2);
         rr.container.addChild(cmt);
       }
-    } else if (rung.comment) {
-      // Compact inline comment when bar is hidden — just a tiny italic line at top
-      const cmt = new Text({
-        text: "// " + rung.comment,
-        style: new TextStyle({ fontSize: 9, fill: C.textDim, fontFamily: "Consolas, monospace", fontStyle: "italic" }),
-      });
-      cmt.position.set(RAIL_W + 4, 2);
-      rr.container.addChild(cmt);
     }
   }
 
@@ -662,6 +816,14 @@ export class LadderRenderer {
     return s.length > max ? s.slice(0, max - 1) + "…" : s;
   }
 
+  private _truncMiddleOperand(s: string): string {
+    return this._truncOp(s || "?", 7);
+  }
+
+  private _truncLiveValue(s: string): string {
+    return this._truncOp(s, 6);
+  }
+
   /**
    * Wire-exit power for a node: uses nodeOutputPowered when available (so
    * terminal blocks like TON show their input lit but their output dark),
@@ -709,17 +871,18 @@ export class LadderRenderer {
     rung: Rung,
     power: RungPowerState | null,
     inputPowered: boolean = false,
-    visualOutPowered?: boolean
+    visualOutPowered?: boolean,
+    readOnly = false
   ) {
     if (isLayoutInstruction(node)) {
       const ast = this._findAstInstruction(rung.nodes, node.nodeId);
       if (!ast) return;
       const powered    = power?.nodePowered.get(node.nodeId) ?? false;
       const outPowered = visualOutPowered ?? this._outPw(power, node.nodeId);
-      const selected   = this._selectedNodeId === node.nodeId;
+      const selected   = !readOnly && this._selectedNodeId === node.nodeId;
       this._drawInstruction(g, container, node, ast, powered, outPowered, selected, inputPowered);
     } else {
-      this._drawBranch(g, container, node, rung, power, inputPowered);
+      this._drawBranch(g, container, node, rung, power, inputPowered, readOnly);
     }
   }
 
@@ -741,8 +904,12 @@ export class LadderRenderer {
 
     const isOutput      = ["OTE","OTL","OTU"].includes(node.type);
     const isTimerCtr    = ["TON","TOF","RTO","CTU","CTD"].includes(node.type);
-    const isCompareMov  = ["EQU","NEQ","LES","LEQ","GRT","GEQ","MOV","MVM"].includes(node.type);
-    const isComplex     = isTimerCtr || node.type === "RES";
+    const isCompareMov  = [
+      "EQU","NEQ","LES","LEQ","GRT","GEQ","MOV","MVM",
+      "ADD","SUB","MUL","DIV","MOD","NEG","ABS","SQR","CLR",
+      "JSR",
+    ].includes(node.type);
+    const isComplex     = isTimerCtr || node.type === "RES" || node.type === "NOP";
 
     const wireColor = powered ? C.wireOn : C.wireOff;
     const tagStyle  = powered ? STYLE_TAG_ON : STYLE_TAG;
@@ -855,7 +1022,9 @@ export class LadderRenderer {
       // 8px margins give visible stubs on each side matching Studio 5000 style.
       const bx = x + 8, by = wireY - 14, bw = w - 16, bh = 58;
       const isMovInst = node.type === "MOV" || node.type === "MVM";
-      const p = node.params as any;
+      const isMathInst = ["ADD","SUB","MUL","DIV","MOD","NEG","ABS","SQR","CLR"].includes(node.type);
+      const isUnaryMath = ["NEG","ABS","SQR","CLR"].includes(node.type);
+      const isJsrInst = node.type === "JSR";
 
       if (selected) {
         g.roundRect(bx - 2, by - 2, bw + 4, bh + 4, 5)
@@ -883,44 +1052,85 @@ export class LadderRenderer {
       const labelSt = new TextStyle({ fontFamily: "Consolas, monospace", fontSize: 9, fill: C.textDim });
       const valSt   = new TextStyle({ fontFamily: "Consolas, monospace", fontSize: 10, fill: powered ? C.textGreen : C.textPrimary });
       const destSt  = new TextStyle({ fontFamily: "Consolas, monospace", fontSize: 10, fill: powered ? C.textGreen : C.textYellow });
+      const liveSt  = new TextStyle({ fontFamily: "Consolas, monospace", fontSize: 10, fill: powered ? C.textGreen : C.textDim, fontWeight: "bold" });
+
+      const drawOperandRow = (label: string, operand: string, rowY: number, style: TextStyle) => {
+        const lbl = new Text({ text: label, style: labelSt });
+        lbl.anchor.set(0, 0.5); lbl.position.set(bx + 4, rowY);
+        container.addChild(lbl);
+
+        const name = new Text({ text: this._truncMiddleOperand(operand), style });
+        name.anchor.set(0, 0.5); name.position.set(bx + 27, rowY);
+        container.addChild(name);
+
+        const liveValue = this._formatLiveValue(operand);
+        if (liveValue) {
+          const live = new Text({ text: this._truncLiveValue(liveValue), style: liveSt });
+          live.anchor.set(1, 0.5); live.position.set(bx + bw - 4, rowY);
+          container.addChild(live);
+        }
+      };
 
       const rowYs  = [wireY + 18, wireY + 36];
       let labels: string[], values: string[];
 
-      if (isMovInst) {
-        labels = ["Src", "Dst"];
-        values = [
-          this._truncOp(p?.source ?? "?"),
-          this._truncOp(p?.dest   ?? "?"),
-        ];
-        if (node.type === "MVM") {
-          labels = ["Src", "Msk", "Dst"];
-          // squeeze 3 rows into the same space
-          const rowY3 = [wireY + 14, wireY + 28, wireY + 42];
-          const vals3 = [this._truncOp(p?.source ?? "?"), this._truncOp(p?.mask ?? "?"), this._truncOp(p?.dest ?? "?")];
+        if (isJsrInst) {
+          const jsr = node.params as JsrParams;
+          labels = ["Routine"];
+          values = [jsr?.routineName ?? ""];
+        } else if (isMovInst) {
+          const move = node.params as MoveParams;
+          labels = ["Src", "Dst"];
+          values = [
+            move?.source ?? "",
+            move?.dest ?? "",
+          ];
+          if (node.type === "MVM") {
+            labels = ["Src", "Msk", "Dst"];
+            // squeeze 3 rows into the same space
+            const rowY3 = [wireY + 14, wireY + 28, wireY + 42];
+            const vals3 = [
+              move?.source ?? "",
+              move?.mask ?? "",
+              move?.dest ?? "",
+            ];
           for (let i = 0; i < 3; i++) {
-            const lbl = new Text({ text: labels[i], style: labelSt });
-            lbl.anchor.set(0, 0.5); lbl.position.set(bx + 4, rowY3[i]);
-            container.addChild(lbl);
-            const val = new Text({ text: vals3[i], style: i < 2 ? valSt : destSt });
-            val.anchor.set(1, 0.5); val.position.set(bx + bw - 4, rowY3[i]);
-            container.addChild(val);
+            drawOperandRow(labels[i], vals3[i], rowY3[i], i < 2 ? valSt : destSt);
           }
           // skip generic 2-row render below
           labels = []; values = [];
         }
-      } else {
-        labels = ["SrcA", "SrcB"];
-        values = [this._truncOp(p?.sourceA ?? "?"), this._truncOp(p?.sourceB ?? "?")];
-      }
+        } else if (isMathInst) {
+          const math = node.params as MathParams;
+          if (isUnaryMath) {
+            labels = node.type === "CLR" ? ["Dst"] : ["Src", "Dst"];
+            values = node.type === "CLR"
+              ? [math?.dest ?? ""]
+              : [math?.sourceA ?? "", math?.dest ?? ""];
+          } else {
+            labels = ["SrcA", "SrcB", "Dst"];
+            const rowY3 = [wireY + 14, wireY + 28, wireY + 42];
+            const vals3 = [
+              math?.sourceA ?? "",
+              math?.sourceB ?? "",
+              math?.dest ?? "",
+            ];
+            for (let i = 0; i < 3; i++) {
+              drawOperandRow(labels[i], vals3[i], rowY3[i], i === 2 ? destSt : valSt);
+            }
+            labels = []; values = [];
+          }
+        } else {
+          const compare = node.params as CompareParams;
+          labels = ["SrcA", "SrcB"];
+          values = [
+            compare?.sourceA ?? "",
+            compare?.sourceB ?? "",
+          ];
+        }
 
       for (let i = 0; i < labels.length; i++) {
-        const lbl = new Text({ text: labels[i], style: labelSt });
-        lbl.anchor.set(0, 0.5); lbl.position.set(bx + 4, rowYs[i]);
-        container.addChild(lbl);
-        const val = new Text({ text: values[i], style: i === 1 && isMovInst ? destSt : valSt });
-        val.anchor.set(1, 0.5); val.position.set(bx + bw - 4, rowYs[i]);
-        container.addChild(val);
+        drawOperandRow(labels[i], values[i], rowYs[i], i === 1 && isMovInst ? destSt : valSt);
       }
 
     } else if (isComplex) {
@@ -944,11 +1154,13 @@ export class LadderRenderer {
       mn.position.set(cx, wireY);
       container.addChild(mn);
 
-      // Tag above box
-      const tag = new Text({ text: node.tagName || "?", style: tagStyle });
-      tag.anchor.set(0.5, 1);
-      tag.position.set(cx, by - 2);
-      container.addChild(tag);
+      // RES is tag-bound; NOP is intentionally parameterless.
+      if (node.type !== "NOP") {
+        const tag = new Text({ text: node.tagName || "?", style: tagStyle });
+        tag.anchor.set(0.5, 1);
+        tag.position.set(cx, by - 2);
+        container.addChild(tag);
+      }
 
     } else if (isOutput) {
       // ── Coil: ─( )─ ──────────────────────────────────────────────────────
@@ -1085,10 +1297,12 @@ export class LadderRenderer {
       }
 
       // Tag above
-      const tag = new Text({ text: node.tagName || "?", style: tagStyle });
-      tag.anchor.set(0.5, 1);
-      tag.position.set(cx, wireY - barH / 2 - 3);
-      container.addChild(tag);
+      if (node.type !== "AFI") {
+        const tag = new Text({ text: node.tagName || "?", style: tagStyle });
+        tag.anchor.set(0.5, 1);
+        tag.position.set(cx, wireY - barH / 2 - 3);
+        container.addChild(tag);
+      }
 
       // Mnemonic below
       const mn = new Text({ text: node.type, style: mnStyle });
@@ -1096,6 +1310,7 @@ export class LadderRenderer {
       mn.position.set(cx, wireY + barH / 2 + 3);
       container.addChild(mn);
     }
+
   }
 
   // ── Branch ────────────────────────────────────────────────────────────────
@@ -1106,7 +1321,8 @@ export class LadderRenderer {
     branch: LayoutBranch,
     rung: Rung,
     power: RungPowerState | null,
-    inputPowered: boolean = false
+    inputPowered: boolean = false,
+    readOnly = false
   ) {
     const branchPowered = power?.nodePowered.get(branch.nodeId) ?? false;
     const railColor = inputPowered ? C.branchRailOn : C.branchRail;
@@ -1153,7 +1369,7 @@ export class LadderRenderer {
           const visualOutPowered = ni < leg.nodes.length - 1
             ? this._wireBetweenPw(power, rung.nodes, leg.nodes[ni], leg.nodes[ni + 1])
             : undefined;
-          this._drawNode(g, container, leg.nodes[ni], rung, power, nodeInputPowered, visualOutPowered);
+          this._drawNode(g, container, leg.nodes[ni], rung, power, nodeInputPowered, visualOutPowered, readOnly);
         }
 
         for (let i = 0; i < leg.nodes.length - 1; i++) {
@@ -1519,6 +1735,95 @@ export class LadderRenderer {
   }
 
   /**
+   * Return the layout of an instruction node. Used by tag drag/drop to map the
+   * drop position to a block field row.
+   */
+  getInstructionLayout(rungId: string, nodeId: string): LayoutInstruction | null {
+    const entry = this._rungLayoutData.find(e => e.rungId === rungId);
+    if (!entry) return null;
+    const node = this._findLayoutNode(entry.layout.nodes, nodeId);
+    if (!node || !isLayoutInstruction(node)) return null;
+    return node;
+  }
+
+  getKeyboardNavigationTarget(
+    selection: { kind: "node"; rungId: string; nodeId: string } | { kind: "rung"; rungId: string } | null,
+    direction: "left" | "right" | "up" | "down"
+  ): KeyboardNavTarget {
+    if (this._rungLayoutData.length === 0) return null;
+    const navNodes = this._collectNavNodes();
+    if (navNodes.length === 0) {
+      const currentIdx = selection?.kind === "rung"
+        ? this._rungLayoutData.findIndex(e => e.rungId === selection.rungId)
+        : -1;
+      const nextIdx = direction === "up"
+        ? Math.max(0, currentIdx - 1)
+        : direction === "down"
+          ? Math.min(this._rungLayoutData.length - 1, Math.max(0, currentIdx + 1))
+          : Math.max(0, currentIdx);
+      return { kind: "rung", rungId: this._rungLayoutData[nextIdx].rungId };
+    }
+
+    if (!selection) {
+      const first = navNodes[0];
+      return { kind: "node", rungId: first.rungId, nodeId: first.nodeId };
+    }
+
+    if (selection.kind === "rung") {
+      const rungNodes = navNodes.filter(n => n.rungId === selection.rungId);
+      if ((direction === "left" || direction === "right") && rungNodes.length > 0) {
+        const target = direction === "left" ? rungNodes[rungNodes.length - 1] : rungNodes[0];
+        return { kind: "node", rungId: target.rungId, nodeId: target.nodeId };
+      }
+      const idx = this._rungLayoutData.findIndex(e => e.rungId === selection.rungId);
+      const nextIdx = direction === "up" ? idx - 1 : direction === "down" ? idx + 1 : idx;
+      const next = this._rungLayoutData[Math.max(0, Math.min(this._rungLayoutData.length - 1, nextIdx))];
+      return next ? { kind: "rung", rungId: next.rungId } : null;
+    }
+
+    const current = navNodes.find(n => n.rungId === selection.rungId && n.nodeId === selection.nodeId);
+    if (!current) return { kind: "rung", rungId: selection.rungId };
+
+    if (direction === "left" || direction === "right") {
+      const next = navNodes[current.order + (direction === "right" ? 1 : -1)];
+      return next ? { kind: "node", rungId: next.rungId, nodeId: next.nodeId } : { kind: "rung", rungId: current.rungId };
+    }
+
+    const candidates = navNodes.filter(n => direction === "up" ? n.cy < current.cy - 1 : n.cy > current.cy + 1);
+    if (candidates.length === 0) return { kind: "rung", rungId: current.rungId };
+    candidates.sort((a, b) => {
+      const dyA = Math.abs(a.cy - current.cy);
+      const dyB = Math.abs(b.cy - current.cy);
+      if (dyA !== dyB) return dyA - dyB;
+      return Math.abs(a.cx - current.cx) - Math.abs(b.cx - current.cx);
+    });
+    const target = candidates[0];
+    return { kind: "node", rungId: target.rungId, nodeId: target.nodeId };
+  }
+
+  private _collectNavNodes(): NavNode[] {
+    const nodes: NavNode[] = [];
+    const addNodes = (rungId: string, rungY: number, layoutNodes: LayoutNode[]) => {
+      for (const node of layoutNodes) {
+        nodes.push({
+          rungId,
+          nodeId: node.nodeId,
+          cx: this.RUNG_NUMBER_W + node.x + node.w / 2,
+          cy: rungY + node.y + node.h / 2,
+          order: nodes.length,
+        });
+        if (isLayoutBranch(node)) {
+          for (const leg of node.legs) addNodes(rungId, rungY, leg.nodes);
+        }
+      }
+    };
+    for (const entry of this._rungLayoutData) {
+      addNodes(entry.rungId, entry.y, entry.layout.nodes);
+    }
+    return nodes;
+  }
+
+  /**
    * Return which branch leg is under the canvas point, ignoring the rail strips
    * themselves (those are handled by hitTestNode).  Used for hover highlighting.
    */
@@ -1576,6 +1881,7 @@ export class LadderRenderer {
    */
   showLegHover(rungId: string, branchId: string, legId: string) {
     this._hoverGfx.clear();
+    this._hoverGfx.removeChildren().forEach(c => c.destroy({ children: true }));
     const entry = this._rungLayoutData.find(e => e.rungId === rungId);
     if (!entry) return;
     const branch = this._findLayoutNode(entry.layout.nodes, branchId);
@@ -1607,6 +1913,7 @@ export class LadderRenderer {
 
   clearLegHover() {
     this._hoverGfx.clear();
+    this._hoverGfx.removeChildren().forEach(c => c.destroy({ children: true }));
   }
 
   /**
@@ -1667,6 +1974,7 @@ export class LadderRenderer {
    */
   showInstructionHover(rungId: string, nodeId: string) {
     this._hoverGfx.clear();
+    this._hoverGfx.removeChildren().forEach(c => c.destroy({ children: true }));
     const entry = this._rungLayoutData.find(e => e.rungId === rungId);
     if (!entry) return;
     const node = this._findLayoutNode(entry.layout.nodes, nodeId);
@@ -1674,6 +1982,85 @@ export class LadderRenderer {
     this._hoverGfx
       .rect(this.RUNG_NUMBER_W + node.x, entry.y + node.y, node.w, node.h)
       .fill({ color: 0x4a8cff, alpha: 0.06 });
+  }
+
+  showInstructionFieldHover(
+    rungId: string,
+    nodeId: string,
+    rowIndex: number,
+    rowCount: number,
+    valid: boolean,
+    label?: string
+  ) {
+    this._hoverGfx.clear();
+    this._hoverGfx.removeChildren().forEach(c => c.destroy({ children: true }));
+    const entry = this._rungLayoutData.find(e => e.rungId === rungId);
+    if (!entry) return;
+    const node = this._findLayoutNode(entry.layout.nodes, nodeId);
+    if (!node) return;
+
+    const color = valid ? 0x4a8cff : 0xff4455;
+    const bx = this.RUNG_NUMBER_W + node.x + 8;
+    const bw = Math.max(node.w - 16, 24);
+    const headerBottom = entry.y + node.wireY + 5;
+    const bodyBottom = entry.y + node.y + node.h - 6;
+    const bodyH = Math.max(bodyBottom - headerBottom, 18);
+    const rowH = bodyH / Math.max(rowCount, 1);
+    const y = headerBottom + rowH * rowIndex;
+
+    this._hoverGfx
+      .roundRect(bx, y, bw, rowH, 3)
+      .fill({ color, alpha: valid ? 0.18 : 0.13 })
+      .stroke({ color, width: 1.5, alpha: valid ? 0.9 : 0.8 });
+
+    if (label) {
+      const txt = new Text({
+        text: label,
+        style: new TextStyle({
+          fontFamily: "Consolas, monospace",
+          fontSize: 9,
+          fill: color,
+          fontWeight: "bold",
+        }),
+      });
+      txt.anchor.set(0, 0.5);
+      txt.position.set(bx + 4, y + rowH / 2);
+      this._hoverGfx.addChild(txt);
+    }
+  }
+
+  showInstructionTagHover(rungId: string, nodeId: string, valid: boolean) {
+    this._hoverGfx.clear();
+    this._hoverGfx.removeChildren().forEach(c => c.destroy({ children: true }));
+    const entry = this._rungLayoutData.find(e => e.rungId === rungId);
+    if (!entry) return;
+    const node = this._findLayoutNode(entry.layout.nodes, nodeId);
+    if (!node) return;
+
+    const color = valid ? 0x4a8cff : 0xff4455;
+    const absX = this.RUNG_NUMBER_W + node.x;
+    const tagW = Math.min(node.w + 8, 86);
+    const tagH = 20;
+    const tagX = absX + node.w / 2 - tagW / 2;
+    const tagY = entry.y + node.wireY - 31;
+
+    this._hoverGfx
+      .roundRect(tagX, tagY, tagW, tagH, 4)
+      .fill({ color, alpha: valid ? 0.16 : 0.12 })
+      .stroke({ color, width: 1.5, alpha: 0.9 });
+
+    const txt = new Text({
+      text: "Tag",
+      style: new TextStyle({
+        fontFamily: "Consolas, monospace",
+        fontSize: 9,
+        fill: color,
+        fontWeight: "bold",
+      }),
+    });
+    txt.anchor.set(0.5, 0.5);
+    txt.position.set(tagX + tagW / 2, tagY + tagH / 2);
+    this._hoverGfx.addChild(txt);
   }
 
   /**
@@ -1819,6 +2206,16 @@ export class LadderRenderer {
   }
 
   /**
+   * Narrower than the full gutter: only the rung-number side starts online edit.
+   * The rail-adjacent gutter strip is intentionally excluded so body/comment
+   * double-clicks near the rail do not accidentally enter online edit.
+   */
+  hitTestOnlineEditGutter(canvasX: number, canvasY: number): string | null {
+    if (canvasX < 6 || canvasX > this.RUNG_NUMBER_W - 13) return null;
+    return this.hitTestGutter(canvasX, canvasY);
+  }
+
+  /**
    * Return true if (canvasX, canvasY) is over the × delete icon in the gutter.
    * The × is drawn at canvas X ≈ 10, canvas Y = rungY + wireY.
    */
@@ -1828,9 +2225,17 @@ export class LadderRenderer {
       e => canvasY >= e.y && canvasY < e.y + e.h
     );
     if (!entry) return false;
-    const delCanvasX = 10; // (-RUNG_NUMBER_W + 10) + RUNG_NUMBER_W = 10
-    const delCanvasY = entry.y + entry.layout.wireY;
-    return Math.abs(canvasX - delCanvasX) < 12 && Math.abs(canvasY - delCanvasY) < 12;
+    return this._isLocalRungDeleteHit(
+      canvasX - this.RUNG_NUMBER_W,
+      canvasY - entry.y,
+      entry.layout.wireY
+    );
+  }
+
+  private _isLocalRungDeleteHit(localX: number, localY: number, wireY: number): boolean {
+    const x = -this.RUNG_NUMBER_W + 1;
+    const y = wireY - 10;
+    return localX >= x && localX <= x + 20 && localY >= y && localY <= y + 20;
   }
 
   /**

@@ -7,8 +7,9 @@ import { Application } from "pixi.js";
 import { useProjectStore } from "../store/projectStore";
 import { useSimulationStore } from "../store/simulationStore";
 import { useEditorStore } from "../store/editorStore";
+import { clearDraggedTagPayload, getDraggedTagPayload, type DraggedTagPayload } from "../store/dragPayload";
 import { LadderRenderer } from "./renderer";
-import type { InstructionType, InsertPosition, Rung, TagDataType, TimerParams, CounterParams, CompareParams, MoveParams } from "../model/types";
+import type { InstructionType, InsertPosition, Rung, TagDataType, TimerParams, CounterParams, CompareParams, MoveParams, MathParams, JsrParams } from "../model/types";
 import {
   findContainingBranch, isBranch,
   applyInsert, applyDelete,
@@ -21,6 +22,13 @@ type TagEditorState = {
   nodeId: string;
   x: number;
   y: number;
+};
+
+type TagDropPreview = {
+  rowIndex: number;
+  rowCount: number;
+  label: string;
+  valid: boolean;
 };
 
 export function PixiCanvas() {
@@ -38,10 +46,11 @@ export function PixiCanvas() {
     insertInstruction, addRung, moveNode, moveRung,
     wrapNodeInBranch, addBranchLeg,
     absorbNext, ejectFromLeg,
-    setInstructionParams,
+    assignTag, setInstructionParams,
     setNodeComment, setRungComment,
+    beginOnlineEditRung,
   } = useProjectStore();
-  const { scanResult } = useSimulationStore();
+  const { scanResult, mode } = useSimulationStore();
   const { selection, drag, showNodeComments, showRungComments, toggleNodeComments, toggleRungComments } = useEditorStore();
   const [tagEditor, setTagEditor] = useState<TagEditorState | null>(null);
   const [complexEditor, setComplexEditor] = useState<TagEditorState | null>(null);
@@ -50,6 +59,7 @@ export function PixiCanvas() {
 
   // Stores the current drag-over drop position â€” use a ref to avoid re-renders
   const dropTargetRef  = useRef<InsertPosition | null>(null);
+  const copiedNodeRef  = useRef<{ routineId: string; rungId: string; nodeId: string } | null>(null);
   // Stores the node being dragged from the canvas (null = dragging from palette)
   const dragNodeRef    = useRef<{ rungId: string; nodeId: string } | null>(null);
   // Stores the rung being dragged for reordering
@@ -91,7 +101,8 @@ export function PixiCanvas() {
     const w = canvasRef.current?.clientWidth ?? app.renderer.width;
     if (w === 0) return;
     const selectedNodeId = selection?.kind === "node" ? selection.nodeId : null;
-    lr.setSelection(selectedNodeId);
+    const selectedRungId = selection?.kind === "rung" ? selection.rungId : null;
+    lr.setSelection(selectedNodeId, selectedRungId);
     lr.setCommentVisibility(showNodeComments, showRungComments);
 
     // During a pointer rail drag, substitute the preview rung so the canvas
@@ -147,17 +158,12 @@ export function PixiCanvas() {
         }
       };
       lr.onRungClick = (rungId) => {
-        const cur = useEditorStore.getState().selection;
-        if (cur?.kind === "rung" && cur.rungId === rungId) {
-          useEditorStore.getState().clearSelection();
-        } else {
-          useEditorStore.getState().setSelection({ kind: "rung", rungId });
-        }
+        useEditorStore.getState().setSelection({ kind: "rung", rungId });
       };
 
       lr.onRungDelete = (rungId) => {
         const { activeRoutineId, deleteRung } = useProjectStore.getState();
-        if (activeRoutineId) {
+        if (activeRoutineId && confirmDeleteRung()) {
           deleteRung(activeRoutineId, rungId);
           useEditorStore.getState().clearSelection();
         }
@@ -220,9 +226,83 @@ export function PixiCanvas() {
       }
 
       const { selection, clearSelection } = useEditorStore.getState();
-      if (!selection) return;
-      const { activeRoutineId, project, deleteNode, deleteRung, setTagValue } = useProjectStore.getState();
+      const { activeRoutineId, project, deleteNode, deleteRung, setTagValue, copyNode, undo, redo } = useProjectStore.getState();
       if (!activeRoutineId) return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        redo();
+        return;
+      }
+
+      if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) {
+        e.preventDefault();
+        const direction = e.key.replace("Arrow", "").toLowerCase() as "left" | "right" | "up" | "down";
+        const target = rendererRef.current?.getKeyboardNavigationTarget(
+          selection?.kind === "node" || selection?.kind === "rung" ? selection : null,
+          direction
+        );
+        if (target) useEditorStore.getState().setSelection(target);
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+        if (selection?.kind !== "node") return;
+        e.preventDefault();
+        copiedNodeRef.current = { routineId: activeRoutineId, rungId: selection.rungId, nodeId: selection.nodeId };
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
+        const copied = copiedNodeRef.current;
+        if (!copied) return;
+        e.preventDefault();
+        const routine = project.programs.flatMap(p => p.routines).find(r => r.id === activeRoutineId);
+        if (!routine) return;
+
+        let position: InsertPosition;
+        if (selection?.kind === "node") {
+          position = { kind: "series-after", rungId: selection.rungId, siblingId: selection.nodeId };
+        } else if (selection?.kind === "leg") {
+          position = {
+            kind: "branch-leg-append",
+            rungId: selection.rungId,
+            branchId: selection.branchId,
+            legId: selection.legId,
+          };
+        } else if (selection?.kind === "rung") {
+          position = { kind: "series-append", rungId: selection.rungId };
+        } else {
+          position = routine.rungs.length > 0
+            ? { kind: "series-append", rungId: routine.rungs[routine.rungs.length - 1].id }
+            : { kind: "rung-append" };
+        }
+
+        const simMode = useSimulationStore.getState().mode;
+        if (simMode === "running") {
+          if (position.kind === "rung-append") {
+            useProjectStore.setState({ lastError: "Double-click a rung gutter to start online edit before pasting in Run." });
+            return;
+          }
+          const targetRung = routine.rungs.find(r => r.id === position.rungId);
+          if (!targetRung?.onlineEditStatus || targetRung.onlineEditStatus === "pending-delete") {
+            useProjectStore.setState({ lastError: "Double-click the rung gutter to start online edit before pasting in Run." });
+            return;
+          }
+        }
+
+        copyNode(activeRoutineId, copied.rungId, copied.nodeId, position);
+        return;
+      }
+
+      if (!selection) return;
 
       if (isSpace) {
         if (selection.kind !== "node") return;
@@ -259,8 +339,10 @@ export function PixiCanvas() {
         });
         clearSelection();
       } else if (selection.kind === "rung") {
-        deleteRung(activeRoutineId, selection.rungId);
-        clearSelection();
+        if (confirmDeleteRung()) {
+          deleteRung(activeRoutineId, selection.rungId);
+          clearSelection();
+        }
       }
     }
 
@@ -301,6 +383,21 @@ export function PixiCanvas() {
     dragNodeRef.current = null;
     rungDragRef.current = null;
     pointerRailRef.current = null;
+
+    if (e.detail >= 2) {
+      const editRungId = lr.hitTestOnlineEditGutter(coords.x, coords.y);
+      if (editRungId && routine) {
+        e.preventDefault();
+        wrap.draggable = false;
+        beginOnlineEditRung(routine.id, editRungId);
+        useEditorStore.getState().setSelection({ kind: "rung", rungId: editRungId });
+        setTagEditor(null);
+        setComplexEditor(null);
+        setCompareMovEditor(null);
+        setRungCommentEditor(null);
+        return;
+      }
+    }
 
     if (hit?.rail) {
       // â”€â”€ Pointer-capture rail drag â€” gives us live pointermove at full rate â”€â”€
@@ -468,7 +565,7 @@ export function PixiCanvas() {
       // Exclude the × delete icon zone so a delete click never triggers a drag.
       if (coords.x < lr.RUNG_NUMBER_W) {
         const gutterRungId = lr.hitTestGutter(coords.x, coords.y);
-        if (gutterRungId && !lr.hitTestRungDeleteButton(coords.x, coords.y)) {
+        if (gutterRungId) {
           rungDragRef.current = { rungId: gutterRungId };
           wrap.draggable = true;
         } else {
@@ -605,7 +702,9 @@ export function PixiCanvas() {
     rendererRef.current?.clearDropZone();
     rendererRef.current?.clearDropAnchors();
     rendererRef.current?.clearExtendTarget();
+    rendererRef.current?.clearLegHover();
     rendererRef.current?.clearRungDropLine();
+    clearDraggedTagPayload();
   }
 
   function getDropInfo(e: React.DragEvent, dragType?: InstructionType) {
@@ -618,6 +717,22 @@ export function PixiCanvas() {
     return lr.queryDropTarget(canvasX, canvasY, dragType);
   }
 
+  function rungAllowsRunEdit(rungId: string): boolean {
+    if (mode !== "running") return true;
+    const rung = routine?.rungs.find(r => r.id === rungId);
+    return !!rung?.onlineEditStatus && rung.onlineEditStatus !== "pending-delete";
+  }
+
+  function positionAllowsRunEdit(position: InsertPosition): boolean {
+    if (mode !== "running") return true;
+    if (position.kind === "rung-append") return false;
+    return rungAllowsRunEdit(position.rungId);
+  }
+
+  function blockRunEdit(message = "Double-click the rung gutter to start online edit before changing logic in Run."): void {
+    useProjectStore.setState({ lastError: message });
+  }
+
   function handleDragOver(e: React.DragEvent) {
     e.preventDefault();
     const isRungMove    = e.dataTransfer.types.includes("application/plc-rung-move");
@@ -625,10 +740,45 @@ export function PixiCanvas() {
     const isRailExtend  = e.dataTransfer.types.includes("application/plc-rail-extend");
     const isBranchWrap  = e.dataTransfer.types.includes("application/plc-branch-wrap");
     const isAddLeg      = e.dataTransfer.types.includes("application/plc-add-leg");
+    const isTagDrop     = e.dataTransfer.types.includes("application/plc-tag");
     e.dataTransfer.dropEffect = (isRungMove || isNodeMove || isRailExtend) ? "move" : "copy";
+
+    if (isTagDrop) {
+      const coords = getCanvasCoords(e);
+      const hit = coords ? rendererRef.current?.hitTestNode(coords.x, coords.y) : null;
+      const tag = readDraggedTag(e);
+      const rung = hit && routine ? routine.rungs.find(r => r.id === hit.rungId) : null;
+      const node = hit && rung ? findNodeById(rung.nodes, hit.nodeId) : null;
+      if (coords && hit && tag && node?.kind === "instruction") {
+        const preview = getTagDropPreview(tag, hit.rungId, node, coords.y);
+        if (preview.rowCount === 1 && preview.label === "Tag") {
+          rendererRef.current?.showInstructionTagHover(hit.rungId, hit.nodeId, preview.valid);
+        } else {
+          rendererRef.current?.showInstructionFieldHover(
+            hit.rungId,
+            hit.nodeId,
+            preview.rowIndex,
+            preview.rowCount,
+            preview.valid,
+            preview.label
+          );
+        }
+      } else {
+        rendererRef.current?.clearLegHover();
+      }
+      rendererRef.current?.clearDropZone();
+      rendererRef.current?.clearDropAnchors();
+      rendererRef.current?.clearExtendTarget();
+      return;
+    }
 
     // ── Rung reorder ─────────────────────────────────────────────────────────
     if (isRungMove) {
+      if (mode === "running") {
+        e.dataTransfer.dropEffect = "none";
+        rendererRef.current?.clearRungDropLine();
+        return;
+      }
       const coords = getCanvasCoords(e);
       if (coords) {
         const drop = rendererRef.current?.queryRungDropY(coords.y);
@@ -642,6 +792,11 @@ export function PixiCanvas() {
 
     if (isRailExtend && railDragRef.current) {
       const { rungId, branchId, side } = railDragRef.current;
+      if (!rungAllowsRunEdit(rungId)) {
+        e.dataTransfer.dropEffect = "none";
+        rendererRef.current?.clearExtendTarget();
+        return;
+      }
       const rung = routine?.rungs.find(r => r.id === rungId);
       const coords = getCanvasCoords(e);
       const lr = rendererRef.current;
@@ -682,6 +837,14 @@ export function PixiCanvas() {
       const target = hit && routine
         ? findNodeById(routine.rungs.find(r => r.id === hit.rungId)?.nodes ?? [], hit.nodeId)
         : null;
+      if (hit && !rungAllowsRunEdit(hit.rungId)) {
+        e.dataTransfer.dropEffect = "none";
+        rendererRef.current?.clearDropZone();
+        rendererRef.current?.clearDropAnchors();
+        rendererRef.current?.clearExtendTarget();
+        rendererRef.current?.clearLegHover();
+        return;
+      }
       rendererRef.current?.clearDropZone();
       rendererRef.current?.clearDropAnchors();
       rendererRef.current?.clearExtendTarget();
@@ -698,6 +861,14 @@ export function PixiCanvas() {
       const hit = coords ? rendererRef.current?.hitTestNode(coords.x, coords.y) : null;
       const rung = hit && routine ? routine.rungs.find(r => r.id === hit.rungId) : null;
       const branchId = hit && rung ? resolveBranchTarget(rung, hit.nodeId) : null;
+      if (hit && !rungAllowsRunEdit(hit.rungId)) {
+        e.dataTransfer.dropEffect = "none";
+        rendererRef.current?.clearDropZone();
+        rendererRef.current?.clearDropAnchors();
+        rendererRef.current?.clearExtendTarget();
+        rendererRef.current?.clearLegHover();
+        return;
+      }
       rendererRef.current?.clearDropZone();
       rendererRef.current?.clearDropAnchors();
       rendererRef.current?.clearExtendTarget();
@@ -713,6 +884,14 @@ export function PixiCanvas() {
       ? drag.instructionType
       : e.dataTransfer.getData("application/plc-instruction") as InstructionType | "";
     const info = getDropInfo(e, paletteType || undefined);
+    if (info?.position && !positionAllowsRunEdit(info.position)) {
+      e.dataTransfer.dropEffect = "none";
+      dropTargetRef.current = null;
+      rendererRef.current?.clearDropAnchors();
+      rendererRef.current?.clearDropZone();
+      rendererRef.current?.clearExtendTarget();
+      return;
+    }
     dropTargetRef.current = info?.position ?? null;
     rendererRef.current?.showDropAnchors(paletteType || undefined);
     rendererRef.current?.showDropZone(info);
@@ -742,12 +921,34 @@ export function PixiCanvas() {
     railDragRef.current = null;
     rungDragRef.current = null;
     if (canvasRef.current) canvasRef.current.draggable = false;
+    clearDraggedTagPayload();
 
     if (!routine) return;
+
+    const tagRaw = e.dataTransfer.getData("application/plc-tag");
+    if (tagRaw) {
+      const coords = getCanvasCoords(e);
+      const hit = coords ? rendererRef.current?.hitTestNode(coords.x, coords.y) : null;
+      const rung = hit ? routine.rungs.find(r => r.id === hit.rungId) : null;
+      const node = hit && rung ? findNodeById(rung.nodes, hit.nodeId) : null;
+      if (coords && hit && rung && node?.kind === "instruction") {
+        try {
+          const tag = JSON.parse(tagRaw) as DraggedTagPayload;
+          applyDraggedTagToInstruction(tag, routine.id, hit.rungId, node, coords.y);
+        } catch {
+          // Ignore malformed drag payloads from outside the app.
+        }
+      }
+      return;
+    }
 
     // ── Rung reorder ─────────────────────────────────────────────────────────
     const rungMoveId = e.dataTransfer.getData("application/plc-rung-move");
     if (rungMoveId) {
+      if (mode === "running") {
+        blockRunEdit("Rung reorder is disabled in Run mode.");
+        return;
+      }
       const coords = getCanvasCoords(e);
       if (coords) {
         const drop = rendererRef.current?.queryRungDropY(coords.y);
@@ -774,6 +975,10 @@ export function PixiCanvas() {
       const hit = coords ? rendererRef.current?.hitTestNode(coords.x, coords.y) : null;
       const rung = hit ? routine.rungs.find(r => r.id === hit.rungId) : null;
       const branchId = hit && rung ? resolveBranchTarget(rung, hit.nodeId) : null;
+      if (hit && !rungAllowsRunEdit(hit.rungId)) {
+        blockRunEdit();
+        return;
+      }
       if (hit && branchId) {
         addBranchLeg(routine.id, hit.rungId, branchId);
       }
@@ -786,6 +991,10 @@ export function PixiCanvas() {
       const hit = coords ? rendererRef.current?.hitTestNode(coords.x, coords.y) : null;
       const rung = hit ? routine.rungs.find(r => r.id === hit.rungId) : null;
       const target = hit && rung ? findNodeById(rung.nodes, hit.nodeId) : null;
+      if (hit && !rungAllowsRunEdit(hit.rungId)) {
+        blockRunEdit();
+        return;
+      }
       if (hit && target?.kind === "instruction") {
         wrapNodeInBranch(routine.id, hit.rungId, hit.nodeId);
       }
@@ -796,6 +1005,10 @@ export function PixiCanvas() {
     const railRaw = e.dataTransfer.getData("application/plc-rail-extend");
     if (railRaw) {
       const src: { rungId: string; branchId: string; side: "left" | "right" } = JSON.parse(railRaw);
+      if (!rungAllowsRunEdit(src.rungId)) {
+        blockRunEdit();
+        return;
+      }
       const rung = routine.rungs.find(r => r.id === src.rungId);
       const branchNode = findNodeById(rung?.nodes ?? [], src.branchId);
       const leg0Id = branchNode?.kind === "branch" ? branchNode.legs[0]?.id : null;
@@ -833,11 +1046,21 @@ export function PixiCanvas() {
       ? { kind: "series-append", rungId: routine.rungs[routine.rungs.length - 1].id }
       : { kind: "rung-append" };
     const position = info?.position ?? fallback;
+    if (!positionAllowsRunEdit(position)) {
+      blockRunEdit();
+      dropTargetRef.current = null;
+      return;
+    }
 
     // â”€â”€ Moving an existing canvas node â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const moveRaw = e.dataTransfer.getData("application/plc-move");
     if (moveRaw) {
       const src: { rungId: string; nodeId: string } = JSON.parse(moveRaw);
+      if (!rungAllowsRunEdit(src.rungId)) {
+        blockRunEdit();
+        dropTargetRef.current = null;
+        return;
+      }
       moveNode(routine.id, src.rungId, src.nodeId, position);
       dropTargetRef.current = null;
       return;
@@ -856,6 +1079,17 @@ export function PixiCanvas() {
     const editorX = outerRect ? e.clientX - outerRect.left : e.clientX;
     const editorY = outerRect ? e.clientY - outerRect.top  : e.clientY;
 
+    const hitGutterRungId = rendererRef.current?.hitTestOnlineEditGutter(coords.x, coords.y);
+    if (hitGutterRungId && routine) {
+      beginOnlineEditRung(routine.id, hitGutterRungId);
+      useEditorStore.getState().setSelection({ kind: "rung", rungId: hitGutterRungId });
+      setTagEditor(null);
+      setComplexEditor(null);
+      setCompareMovEditor(null);
+      setRungCommentEditor(null);
+      return;
+    }
+
     const hit = rendererRef.current?.hitTestNode(coords.x, coords.y);
     const rung = hit ? routine?.rungs.find(r => r.id === hit.rungId) : null;
     const node = hit && rung ? findNodeById(rung.nodes, hit.nodeId) : null;
@@ -863,8 +1097,15 @@ export function PixiCanvas() {
     if (hit && node?.kind === "instruction") {
       const editorState: TagEditorState = { rungId: hit.rungId, nodeId: hit.nodeId, x: editorX, y: editorY };
       useEditorStore.getState().setSelection({ kind: "node", rungId: hit.rungId, nodeId: hit.nodeId });
+      if (node.type === "NOP") {
+        setTagEditor(null);
+        setComplexEditor(null);
+        setCompareMovEditor(null);
+        setRungCommentEditor(null);
+        return;
+      }
       const isTimerCounter = ["TON","TOF","RTO","CTU","CTD"].includes(node.type);
-      const isCompareMov   = ["EQU","NEQ","LES","LEQ","GRT","GEQ","MOV","MVM"].includes(node.type);
+      const isCompareMov   = COMPARE_MOVE_TYPES.has(node.type);
       if (isTimerCounter) {
         setComplexEditor(editorState);
         setTagEditor(null);
@@ -884,12 +1125,13 @@ export function PixiCanvas() {
       return;
     }
 
-    // No instruction hit — check for rung body (opens rung comment editor)
+    // No instruction hit: double-clicking rung body opens the comment editor.
     const hitRungId = rendererRef.current?.hitTestRungBody(coords.x, coords.y);
     if (hitRungId) {
       setRungCommentEditor({ rungId: hitRungId, nodeId: "", x: editorX, y: editorY });
       setTagEditor(null);
       setComplexEditor(null);
+      setCompareMovEditor(null);
     }
   }
 
@@ -899,6 +1141,132 @@ export function PixiCanvas() {
   }
 
   // â”€â”€ Render â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  function applyDraggedTagToInstruction(
+    tag: DraggedTagPayload,
+    routineId: string,
+    rungId: string,
+    node: ReturnType<typeof findNodeById> & { kind: "instruction" },
+    canvasY: number
+  ) {
+    const type = node.type;
+    const isBool = tag.dataType === "BOOL";
+    const isNumeric = tag.dataType === "BOOL" || tag.dataType === "DINT" || tag.dataType === "INT" || tag.dataType === "REAL";
+
+    if (["XIC","XIO","OSR","OSF","ONS","OTE","OTL","OTU"].includes(type)) {
+      if (isBool) assignTag(routineId, rungId, node.id, tag.name);
+      return;
+    }
+
+    if (["TON","TOF","RTO"].includes(type)) {
+      if (tag.dataType === "TIMER") assignTag(routineId, rungId, node.id, tag.name);
+      return;
+    }
+
+    if (["CTU","CTD"].includes(type)) {
+      if (tag.dataType === "COUNTER") assignTag(routineId, rungId, node.id, tag.name);
+      return;
+    }
+
+    if (type === "RES") {
+      if (tag.dataType === "TIMER" || tag.dataType === "COUNTER") assignTag(routineId, rungId, node.id, tag.name);
+      return;
+    }
+
+    if (!isNumeric) return;
+
+    const layout = rendererRef.current?.getInstructionLayout(rungId, node.id);
+    const bounds = rendererRef.current?.getRungBounds(rungId);
+    if (!layout || !bounds) return;
+
+    const relToWire = canvasY - bounds.y - layout.wireY;
+
+    if (["EQU","NEQ","LES","LEQ","GRT","GEQ"].includes(type)) {
+      setInstructionParams(routineId, rungId, node.id, { [relToWire < 27 ? "sourceA" : "sourceB"]: tag.name });
+      return;
+    }
+
+    if (type === "MOV") {
+      setInstructionParams(routineId, rungId, node.id, { [relToWire < 27 ? "source" : "dest"]: tag.name });
+      return;
+    }
+
+    if (type === "MVM") {
+      const field = relToWire < 21 ? "source" : relToWire < 35 ? "mask" : "dest";
+      setInstructionParams(routineId, rungId, node.id, { [field]: tag.name });
+      return;
+    }
+
+    if (["ADD","SUB","MUL","DIV","MOD"].includes(type)) {
+      const field = relToWire < 21 ? "sourceA" : relToWire < 35 ? "sourceB" : "dest";
+      setInstructionParams(routineId, rungId, node.id, { [field]: tag.name });
+      return;
+    }
+
+    if (["NEG","ABS","SQR"].includes(type)) {
+      setInstructionParams(routineId, rungId, node.id, { [relToWire < 27 ? "sourceA" : "dest"]: tag.name });
+      return;
+    }
+
+    if (type === "CLR") setInstructionParams(routineId, rungId, node.id, { dest: tag.name });
+  }
+
+  function readDraggedTag(e: React.DragEvent): DraggedTagPayload | null {
+    const raw = e.dataTransfer.getData("application/plc-tag");
+    if (!raw) return getDraggedTagPayload();
+    try {
+      return JSON.parse(raw) as DraggedTagPayload;
+    } catch {
+      return getDraggedTagPayload();
+    }
+  }
+
+  function getTagDropPreview(
+    tag: DraggedTagPayload,
+    rungId: string,
+    node: ReturnType<typeof findNodeById> & { kind: "instruction" },
+    canvasY: number
+  ): TagDropPreview {
+    const type = node.type;
+    const isBool = tag.dataType === "BOOL";
+    const isNumeric = tag.dataType === "BOOL" || tag.dataType === "DINT" || tag.dataType === "INT" || tag.dataType === "REAL";
+    const simple = (label: string, valid: boolean): TagDropPreview => ({ rowIndex: 0, rowCount: 1, label, valid });
+
+    if (["XIC","XIO","OSR","OSF","ONS","OTE","OTL","OTU"].includes(type)) {
+      return simple("Tag", isBool);
+    }
+    if (["TON","TOF","RTO"].includes(type)) return simple("Timer", tag.dataType === "TIMER");
+    if (["CTU","CTD"].includes(type)) return simple("Counter", tag.dataType === "COUNTER");
+    if (type === "RES") return simple("Timer/Counter", tag.dataType === "TIMER" || tag.dataType === "COUNTER");
+
+    const layout = rendererRef.current?.getInstructionLayout(rungId, node.id);
+    const bounds = rendererRef.current?.getRungBounds(rungId);
+    if (!layout || !bounds) return simple("No drop", false);
+    const relToWire = canvasY - bounds.y - layout.wireY;
+
+    if (["EQU","NEQ","LES","LEQ","GRT","GEQ"].includes(type)) {
+      const rowIndex = relToWire < 27 ? 0 : 1;
+      return { rowIndex, rowCount: 2, label: rowIndex === 0 ? "SrcA" : "SrcB", valid: isNumeric };
+    }
+    if (type === "MOV") {
+      const rowIndex = relToWire < 27 ? 0 : 1;
+      return { rowIndex, rowCount: 2, label: rowIndex === 0 ? "Src" : "Dst", valid: isNumeric };
+    }
+    if (type === "MVM") {
+      const rowIndex = relToWire < 21 ? 0 : relToWire < 35 ? 1 : 2;
+      return { rowIndex, rowCount: 3, label: ["Src", "Msk", "Dst"][rowIndex], valid: isNumeric };
+    }
+    if (["ADD","SUB","MUL","DIV","MOD"].includes(type)) {
+      const rowIndex = relToWire < 21 ? 0 : relToWire < 35 ? 1 : 2;
+      return { rowIndex, rowCount: 3, label: ["SrcA", "SrcB", "Dst"][rowIndex], valid: isNumeric };
+    }
+    if (["NEG","ABS","SQR"].includes(type)) {
+      const rowIndex = relToWire < 27 ? 0 : 1;
+      return { rowIndex, rowCount: 2, label: rowIndex === 0 ? "Src" : "Dst", valid: isNumeric };
+    }
+    if (type === "CLR") return { rowIndex: 0, rowCount: 1, label: "Dst", valid: isNumeric };
+    return simple("No drop", false);
+  }
+
   if (!routine) {
     return <div className="pixi-canvas-wrap pixi-canvas-wrap--empty">No routine selected</div>;
   }
@@ -985,6 +1353,14 @@ export function PixiCanvas() {
           branchId={selection.branchId}
           legId={selection.legId}
           routineId={routine.id}
+        />
+      )}
+
+      {selection?.kind === "rung" && (
+        <RungBar
+          rungId={selection.rungId}
+          routineId={routine.id}
+          canDelete={routine.rungs.length > 0}
         />
       )}
     </div>
@@ -1410,7 +1786,13 @@ function ComplexParamEditor({ editor, routineId, onClose }: {
 // Compare / Move operand editor  (double-click on EQU/NEQ/… / MOV/MVM)
 // ---------------------------------------------------------------------------
 
-const COMPARE_MOVE_TYPES = new Set(["EQU","NEQ","LES","LEQ","GRT","GEQ","MOV","MVM"]);
+const MATH_TYPES = new Set(["ADD","SUB","MUL","DIV","MOD","NEG","ABS","SQR","CLR"]);
+const BINARY_MATH_TYPES = new Set(["ADD","SUB","MUL","DIV","MOD"]);
+const COMPARE_MOVE_TYPES = new Set([
+  "EQU","NEQ","LES","LEQ","GRT","GEQ","MOV","MVM",
+  ...MATH_TYPES,
+  "JSR",
+]);
 
 function CompareMovEditor({ editor, routineId, onClose }: {
   editor: TagEditorState;
@@ -1425,14 +1807,26 @@ function CompareMovEditor({ editor, routineId, onClose }: {
   const node    = rung ? findNodeById(rung.nodes, editor.nodeId) : null;
   if (!node || node.kind !== "instruction") return null;
 
+  const isJsrInst = node.type === "JSR";
   const isMovInst = node.type === "MOV" || node.type === "MVM";
   const isMVM     = node.type === "MVM";
+  const isMathInst = MATH_TYPES.has(node.type);
+  const isBinaryMath = BINARY_MATH_TYPES.has(node.type);
+  const isClr = node.type === "CLR";
   const cp = node.params as CompareParams;
   const mp = node.params as MoveParams;
+  const math = node.params as MathParams;
+  const jsr = node.params as JsrParams;
 
-  const [fieldA, setFieldA] = useState(isMovInst ? (mp.source ?? "") : (cp.sourceA ?? ""));
-  const [fieldB, setFieldB] = useState(isMovInst ? (mp.dest   ?? "") : (cp.sourceB ?? ""));
+  const [fieldA, setFieldA] = useState(isMathInst ? (math.sourceA ?? "") : isMovInst ? (mp.source ?? "") : (cp.sourceA ?? ""));
+  const [fieldB, setFieldB] = useState(isMathInst ? (math.sourceB ?? "") : isMovInst ? (mp.dest   ?? "") : (cp.sourceB ?? ""));
+  const [fieldDest, setFieldDest] = useState(isMathInst ? (math.dest ?? "") : "");
   const [fieldMask, setFieldMask] = useState(isMVM ? ((node.params as MoveParams).mask ?? "0xFFFFFFFF") : "");
+  const routines = project.programs.flatMap(program => program.routines);
+  const [routineName, setRoutineName] = useState(jsr.routineName || routines.find(r => r.id !== routineId)?.name || "");
+  type OperandField = "sourceA" | "sourceB" | "dest" | "mask";
+  const [activeField, setActiveField] = useState<OperandField | null>(null);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
 
   type OperandSuggestion = { id: string; name: string; dataType: string };
 
@@ -1469,10 +1863,10 @@ function CompareMovEditor({ editor, routineId, onClose }: {
   function suggestionsFor(val: string) {
     const lower = val.trim().toLowerCase();
     if (/^-?[\d.]/.test(lower) || /^0x/i.test(lower)) return [];
-    if (!lower) return operandTags.slice(0, 8);
+    if (!lower) return operandTags.slice(0, 10);
     return operandTags
       .filter(t => t.name.toLowerCase().includes(lower))
-      .slice(0, 8);
+      .slice(0, 10);
   }
 
   function normalizeOperandRef(value: string): string {
@@ -1490,11 +1884,27 @@ function CompareMovEditor({ editor, routineId, onClose }: {
   }
 
   function commit() {
+    if (isJsrInst) {
+      setInstructionParams(routineId, editor.rungId, editor.nodeId, {
+        routineName: routineName.trim(),
+      });
+      onClose();
+      return;
+    }
+
     const a = normalizeOperandRef(fieldA);
     const b = normalizeOperandRef(fieldB);
     const mask = normalizeOperandRef(fieldMask);
 
-    if (isMovInst) {
+    if (isMathInst) {
+      const dest = normalizeOperandRef(fieldDest);
+      if (dest && !isExistingStructuredRef(dest) && !project.tags.find(t => t.name === dest)) {
+        addTag(dest, "DINT");
+      }
+      const patch: Partial<MathParams> = { sourceA: a, dest };
+      if (isBinaryMath) patch.sourceB = b;
+      setInstructionParams(routineId, editor.rungId, editor.nodeId, patch);
+    } else if (isMovInst) {
       // Auto-create dest tag if it looks like a tag name and doesn't exist
       const destIsLiteral = !isNaN(Number(b)) || /^0x/i.test(b);
       if (!destIsLiteral && b && !isExistingStructuredRef(b) && !project.tags.find(t => t.name === b)) {
@@ -1502,26 +1912,103 @@ function CompareMovEditor({ editor, routineId, onClose }: {
       }
       const patch: Partial<MoveParams> = { source: a, dest: b };
       if (isMVM) patch.mask = mask || "0xFFFFFFFF";
-      setInstructionParams(routineId, editor.rungId, editor.nodeId, patch as any);
+      setInstructionParams(routineId, editor.rungId, editor.nodeId, patch);
     } else {
       setInstructionParams(routineId, editor.rungId, editor.nodeId,
-        { sourceA: a, sourceB: b } as any);
+        { sourceA: a, sourceB: b });
     }
     onClose();
   }
 
-  function handleKey(e: React.KeyboardEvent) {
-    if (e.key === "Escape") { e.preventDefault(); onClose(); }
-    if (e.key === "Enter")  { e.preventDefault(); commit(); }
+  function handleFocus(field: OperandField) {
+    setActiveField(field);
+    setActiveSuggestionIndex(0);
   }
 
-  const labelA = isMovInst ? "Source"      : "Source A";
-  const labelB = isMovInst ? "Destination" : "Source B";
-  const hintA  = isMovInst ? "tag or literal" : "tag or literal";
-  const hintB  = isMovInst ? "tag name"        : "tag or literal";
+  function handleOperandKey(
+    e: React.KeyboardEvent<HTMLInputElement>,
+    field: OperandField,
+    suggestions: OperandSuggestion[],
+    setValue: (value: string) => void
+  ) {
+    if (e.key === "ArrowDown" && suggestions.length > 0) {
+      e.preventDefault();
+      setActiveField(field);
+      setActiveSuggestionIndex(i => Math.min(i + 1, suggestions.length - 1));
+      return;
+    }
+    if (e.key === "ArrowUp" && suggestions.length > 0) {
+      e.preventDefault();
+      setActiveField(field);
+      setActiveSuggestionIndex(i => Math.max(i - 1, 0));
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      if (activeField) setActiveField(null);
+      else onClose();
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (activeField === field && suggestions.length > 0) {
+        setValue(suggestions[activeSuggestionIndex]?.name ?? suggestions[0].name);
+        setActiveField(null);
+        setActiveSuggestionIndex(0);
+        return;
+      }
+      commit();
+    }
+  }
 
-  const sugA = suggestionsFor(fieldA);
-  const sugB = suggestionsFor(fieldB);
+  const labelA = isClr ? "Source" : isMovInst ? "Source"      : "Source A";
+  const labelB = isMovInst ? "Destination" : "Source B";
+  const hintA  = "tag or literal";
+  const hintB  = isMovInst ? "tag name" : "tag or literal";
+
+  const sugA = activeField === "sourceA" ? suggestionsFor(fieldA) : [];
+  const sugB = activeField === "sourceB" ? suggestionsFor(fieldB) : [];
+  const sugDest = activeField === "dest" ? suggestionsFor(fieldDest) : [];
+  const sugMask = activeField === "mask" ? suggestionsFor(fieldMask) : [];
+
+  if (isJsrInst) {
+    return (
+      <div
+        ref={panelRef}
+        className="tag-quick-edit"
+        style={{ left: editor.x, top: editor.y, minWidth: 230 }}
+        onPointerDown={e => e.stopPropagation()}
+      >
+        <div className="tag-quick-edit-head">
+          <span>JSR</span>
+          <button type="button" onClick={onClose}>x</button>
+        </div>
+        <label className="tag-quick-edit-type"><span>Routine</span></label>
+        <select
+          className="tag-quick-edit-input"
+          autoFocus
+          value={routineName}
+          onChange={e => setRoutineName(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === "Enter") commit();
+            if (e.key === "Escape") onClose();
+          }}
+        >
+          <option value="">Select routine</option>
+          {routines.map(r => (
+            <option key={r.id} value={r.name}>{r.name}</option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="tag-quick-edit-apply"
+          onClick={commit}
+        >
+          Apply
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -1536,42 +2023,92 @@ function CompareMovEditor({ editor, routineId, onClose }: {
       </div>
 
       {/* Field A */}
-      <label className="tag-quick-edit-type"><span>{labelA}</span></label>
-      <input
-        autoFocus
-        className="tag-quick-edit-input"
-        value={fieldA}
-        placeholder={hintA}
-        onChange={e => setFieldA(e.target.value)}
-        onKeyDown={handleKey}
-      />
-      {sugA.length > 0 && (
-        <div className="tag-quick-edit-list">
-          {sugA.map(t => (
-            <button key={t.id} type="button" onClick={() => setFieldA(t.name)}>
-              <span>{t.name}</span><em>{t.dataType}</em>
-            </button>
-          ))}
-        </div>
+      {!isClr && (
+        <>
+          <label className="tag-quick-edit-type"><span>{labelA}</span></label>
+          <input
+            autoFocus
+            className="tag-quick-edit-input"
+            value={fieldA}
+            placeholder={hintA}
+            onFocus={() => handleFocus("sourceA")}
+            onChange={e => { setFieldA(e.target.value); setActiveSuggestionIndex(0); }}
+            onKeyDown={e => handleOperandKey(e, "sourceA", sugA, setFieldA)}
+          />
+          {sugA.length > 0 && (
+            <div className="tag-quick-edit-list">
+              {sugA.map((t, i) => (
+                <button
+                  key={t.id}
+                  className={i === activeSuggestionIndex ? "active" : ""}
+                  type="button"
+                  onMouseDown={e => { e.preventDefault(); setFieldA(t.name); setActiveField(null); }}
+                >
+                  <span>{t.name}</span><em>{t.dataType}</em>
+                </button>
+              ))}
+            </div>
+          )}
+        </>
       )}
 
       {/* Field B */}
-      <label className="tag-quick-edit-type" style={{ marginTop: 6 }}><span>{labelB}</span></label>
-      <input
-        className="tag-quick-edit-input"
-        value={fieldB}
-        placeholder={hintB}
-        onChange={e => setFieldB(e.target.value)}
-        onKeyDown={handleKey}
-      />
-      {sugB.length > 0 && (
-        <div className="tag-quick-edit-list">
-          {sugB.map(t => (
-            <button key={t.id} type="button" onClick={() => setFieldB(t.name)}>
-              <span>{t.name}</span><em>{t.dataType}</em>
-            </button>
-          ))}
-        </div>
+      {(!isMathInst || isBinaryMath) && (
+        <>
+          <label className="tag-quick-edit-type" style={{ marginTop: 6 }}><span>{labelB}</span></label>
+          <input
+            className="tag-quick-edit-input"
+            value={fieldB}
+            placeholder={hintB}
+            onFocus={() => handleFocus("sourceB")}
+            onChange={e => { setFieldB(e.target.value); setActiveSuggestionIndex(0); }}
+            onKeyDown={e => handleOperandKey(e, "sourceB", sugB, setFieldB)}
+          />
+          {sugB.length > 0 && (
+            <div className="tag-quick-edit-list">
+              {sugB.map((t, i) => (
+                <button
+                  key={t.id}
+                  className={i === activeSuggestionIndex ? "active" : ""}
+                  type="button"
+                  onMouseDown={e => { e.preventDefault(); setFieldB(t.name); setActiveField(null); }}
+                >
+                  <span>{t.name}</span><em>{t.dataType}</em>
+                </button>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Destination field for math */}
+      {isMathInst && (
+        <>
+          <label className="tag-quick-edit-type" style={{ marginTop: 6 }}><span>Destination</span></label>
+          <input
+            autoFocus={isClr}
+            className="tag-quick-edit-input"
+            value={fieldDest}
+            placeholder="tag name"
+            onFocus={() => handleFocus("dest")}
+            onChange={e => { setFieldDest(e.target.value); setActiveSuggestionIndex(0); }}
+            onKeyDown={e => handleOperandKey(e, "dest", sugDest, setFieldDest)}
+          />
+          {sugDest.length > 0 && (
+            <div className="tag-quick-edit-list">
+              {sugDest.map((t, i) => (
+                <button
+                  key={t.id}
+                  className={i === activeSuggestionIndex ? "active" : ""}
+                  type="button"
+                  onMouseDown={e => { e.preventDefault(); setFieldDest(t.name); setActiveField(null); }}
+                >
+                  <span>{t.name}</span><em>{t.dataType}</em>
+                </button>
+              ))}
+            </div>
+          )}
+        </>
       )}
 
       {/* Mask field for MVM */}
@@ -1582,9 +2119,24 @@ function CompareMovEditor({ editor, routineId, onClose }: {
             className="tag-quick-edit-input"
             value={fieldMask}
             placeholder="0xFFFFFFFF or tag"
-            onChange={e => setFieldMask(e.target.value)}
-            onKeyDown={handleKey}
+            onFocus={() => handleFocus("mask")}
+            onChange={e => { setFieldMask(e.target.value); setActiveSuggestionIndex(0); }}
+            onKeyDown={e => handleOperandKey(e, "mask", sugMask, setFieldMask)}
           />
+          {sugMask.length > 0 && (
+            <div className="tag-quick-edit-list">
+              {sugMask.map((t, i) => (
+                <button
+                  key={t.id}
+                  className={i === activeSuggestionIndex ? "active" : ""}
+                  type="button"
+                  onMouseDown={e => { e.preventDefault(); setFieldMask(t.name); setActiveField(null); }}
+                >
+                  <span>{t.name}</span><em>{t.dataType}</em>
+                </button>
+              ))}
+            </div>
+          )}
         </>
       )}
 
@@ -1695,7 +2247,6 @@ function LegBar({ rungId, branchId, legId, routineId }: {
 // Rung selection bar  (rung background clicked)
 // ---------------------------------------------------------------------------
 
-/*
 function RungBar({ rungId, routineId, canDelete }: {
   rungId: string; routineId: string; canDelete: boolean;
 }) {
@@ -1703,6 +2254,7 @@ function RungBar({ rungId, routineId, canDelete }: {
   const { clearSelection } = useEditorStore();
 
   function handleDelete() {
+    if (!confirmDeleteRung()) return;
     deleteRung(routineId, rungId);
     clearSelection();
   }
@@ -1711,7 +2263,7 @@ function RungBar({ rungId, routineId, canDelete }: {
     <div className="selection-bar">
       <span className="sel-type" style={{ color: "var(--text-dim)" }}>RUNG</span>
       <span className="sel-hint" style={{ flex: 1 }}>
-        Click a node to edit Â· Esc to deselect
+        Double-click gutter to online edit - Double-click rung body for comment - Esc to deselect
       </span>
       {canDelete && (
         <button className="sel-delete-btn" onClick={handleDelete}>Delete Rung</button>
@@ -1719,11 +2271,13 @@ function RungBar({ rungId, routineId, canDelete }: {
     </div>
   );
 }
-
-*/
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function confirmDeleteRung(): boolean {
+  return window.confirm("Delete this rung? This cannot be undone.");
+}
 
 function findNodeById(nodes: any[], id: string): any {
   for (const n of nodes) {

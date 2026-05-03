@@ -3,17 +3,44 @@
 // =============================================================================
 import { useState, useRef, useEffect } from "react";
 import { useProjectStore } from "../../store/projectStore";
+import { clearDraggedTagPayload, setDraggedTagPayload } from "../../store/dragPayload";
 import type { TagDefinition, TagDataType } from "../../model/types";
 import "./TagPanel.css";
 
-export function TagPanel() {
+type TagPanelProps = {
+  embedded?: boolean;
+};
+
+export function TagPanel({ embedded = false }: TagPanelProps) {
   const { project, addTag, deleteTag, setTagValue } = useProjectStore();
   const [newName, setNewName]   = useState("");
   const [newType, setNewType]   = useState<TagDataType>("BOOL");
   const [newSize, setNewSize]   = useState("1");
   const [error, setError]       = useState("");
+  const [query, setQuery]       = useState("");
+  const [openGroups, setOpenGroups] = useState<Set<TagDataType>>(
+    () => new Set(["BOOL", "DINT", "INT", "REAL", "TIMER", "COUNTER"])
+  );
 
   const showSizeField = newType === "DINT" || newType === "INT";
+  const tagTypes: TagDataType[] = ["BOOL", "DINT", "INT", "REAL", "TIMER", "COUNTER"];
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredTags = normalizedQuery
+    ? project.tags.filter(tag =>
+        tag.name.toLowerCase().includes(normalizedQuery) ||
+        tag.dataType.toLowerCase().includes(normalizedQuery) ||
+        (tag.description ?? "").toLowerCase().includes(normalizedQuery)
+      )
+    : project.tags;
+
+  function toggleGroup(type: TagDataType) {
+    setOpenGroups(groups => {
+      const next = new Set(groups);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
+  }
 
   function handleAddTag() {
     const name = newName.trim();
@@ -37,8 +64,8 @@ export function TagPanel() {
   }
 
   return (
-    <div className="tag-panel">
-      <div className="tag-panel-header">Tag Database</div>
+    <div className={`tag-panel${embedded ? " tag-panel--embedded" : ""}`}>
+      {!embedded && <div className="tag-panel-header">Tag Database</div>}
 
       {/* Add tag form */}
       <div className="tag-add-form">
@@ -78,23 +105,61 @@ export function TagPanel() {
         {error && <div className="tag-error">{error}</div>}
       </div>
 
+      <div className="tag-search">
+        <input
+          className="tag-search-input"
+          placeholder="Search tags / watch table"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+        />
+        <div className="tag-search-meta">
+          {filteredTags.length} of {project.tags.length} tags
+        </div>
+      </div>
+
       {/* Tag list */}
       <div className="tag-list">
         {project.tags.length === 0 && (
           <div className="tag-empty">No tags defined</div>
         )}
-        {project.tags.map(tag => (
-          <TagRow
-            key={tag.id}
-            tag={tag}
-            onToggle={() => {
-              if (tag.dataType === "BOOL") {
-                setTagValue(tag.name, !(tag.value as boolean));
-              }
-            }}
-            onDelete={() => deleteTag(tag.id)}
-          />
-        ))}
+        {project.tags.length > 0 && filteredTags.length === 0 && (
+          <div className="tag-empty">No tags match "{query}"</div>
+        )}
+        {tagTypes.map(type => {
+          const tags = filteredTags.filter(tag => tag.dataType === type);
+          if (tags.length === 0) return null;
+          const isOpen = openGroups.has(type);
+
+          return (
+            <div key={type} className={`tag-group tag-group--${type.toLowerCase()}`}>
+              <button
+                className="tag-group-label"
+                type="button"
+                onClick={() => toggleGroup(type)}
+              >
+                <span>{type}</span>
+                <span className="tag-group-count">{tags.length}</span>
+                <span className={`tag-group-chevron${isOpen ? "" : " tag-group-chevron--closed"}`}>▾</span>
+              </button>
+              <div className={`tag-group-body${isOpen ? "" : " tag-group-body--closed"}`}>
+                <div className="tag-group-body-inner">
+                  {tags.map(tag => (
+                    <TagRow
+                      key={tag.id}
+                      tag={tag}
+                      onToggle={() => {
+                        if (tag.dataType === "BOOL") {
+                          setTagValue(tag.name, !(tag.value as boolean));
+                        }
+                      }}
+                      onDelete={() => deleteTag(tag.id)}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -173,10 +238,27 @@ function TagRow({
 
   const hasDesc = !!tag.description;
 
+  function handleDragStart(e: React.DragEvent) {
+    const payload = {
+      name: tag.name,
+      dataType: tag.dataType,
+    };
+    setDraggedTagPayload(payload);
+    e.dataTransfer.effectAllowed = "copy";
+    e.dataTransfer.setData("application/plc-tag", JSON.stringify(payload));
+    e.dataTransfer.setData("text/plain", tag.name);
+  }
+
   return (
     <div className={`tag-row ${tag.dataType === "BOOL" && tag.value ? "tag-row--true" : ""}`}>
       {/* ── Main row: name · type · value · delete ── */}
-      <div className="tag-row-main">
+      <div
+        className="tag-row-main"
+        draggable
+        onDragStart={handleDragStart}
+        onDragEnd={clearDraggedTagPayload}
+        title="Drag onto a compatible instruction field"
+      >
         {/* Expand toggle for DINT/INT tags (array or scalar) */}
         {isExpandable ? (
           <button
